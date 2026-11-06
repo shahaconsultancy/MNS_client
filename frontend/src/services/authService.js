@@ -31,6 +31,7 @@ export function logout() {
     s.removeItem(REFRESH_KEY);
     s.removeItem(EMAIL_KEY);
   });
+  sessionStorage.removeItem('mns_clients_cache');
 }
 
 const EMAIL_KEY = 'mns_user_email';
