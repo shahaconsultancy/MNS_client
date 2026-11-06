@@ -24,7 +24,9 @@ class ClientPlanView(APIView):
         return get_object_or_404(Client, pk=pk, advisor=request.user)
 
     def get(self, request, pk):
-        return Response(plan_data(self.get_client(request, pk)))
+        client = self.get_client(request, pk)
+        # Include the client itself so the page needs one request, not "list all clients" + "get plan".
+        return Response({**plan_data(client), 'client': ClientSerializer(client).data})
 
     def put(self, request, pk):
         client = self.get_client(request, pk)

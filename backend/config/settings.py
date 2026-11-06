@@ -67,6 +67,9 @@ DATABASES = {
         conn_max_age=60,
     )
 }
+if os.getenv('VERCEL'):
+    # Serverless: fail fast instead of hanging if the database (e.g. a sleeping Neon compute) is slow to answer.
+    DATABASES['default'].setdefault('OPTIONS', {}).setdefault('connect_timeout', 10)
 
 AUTH_USER_MODEL = 'accounts.User'
 
