@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, ChevronDown, Download, FileSpreadsheet, FileText, Save, Upload } from 'lucide-react';
 import { exportExcel, exportPdf } from './exportPlan.js';
 import { readPlanFile } from './importPlan.js';
-import { getPlan, savePlan } from '../../../services/clientService.js';
+import { getCachedClient, getCachedPlan, getPlan, savePlan } from '../../../services/clientService.js';
 import { fromPlan, toPayload } from './planApi.js';
 import { TABS } from './tabs.js';
 import { inr, pct } from './format.js';
@@ -56,6 +56,7 @@ export default function ClientPlanPage() {
   const fileRef = useRef(null);
   const [pending, setPending] = useState(null);
   const [notice, setNotice] = useState('');
+  const [ready, setReady] = useState(false); // false while the saved plan is still being fetched in the background
 
   useEffect(() => {
     const close = (e) => { if (menuRef.current && !menuRef.current.contains(e.target)) setMenuOpen(false); };
@@ -64,38 +65,58 @@ export default function ClientPlanPage() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    const EMPTY = { info: null, insurance: null, retirement: null, family: [], goals: [], income: [], expenses: [], investments: [], assets: [], liabilities: [] };
+
+    const apply = (data, c) => {
+      const defaults = {
+        info: {
+          clientName: c.full_name.toUpperCase(),
+          spouseName: '',
+          phone: c.mobile || '',
+          email: c.email || '',
+          address: '',
+          planDate: today(),
+          advisorNotes: '',
+        },
+        insurance: DEFAULT_INSURANCE,
+        retirement: DEFAULT_RETIREMENT,
+      };
+      const plan = fromPlan(data, defaults);
+      setInfo(plan.info);
+      setIncome(plan.income);
+      setExpenses(plan.expenses);
+      setSavings(plan.savings);
+      setAssetData(plan.assetData);
+      setLiabilityData(plan.liabilityData);
+      setInsurance(plan.insurance);
+      setFamily(plan.family);
+      setGoals(plan.goals);
+      setRetirement(plan.retirement);
+      setSaved(JSON.stringify(plan));
+      setClient(c);
+    };
+
+    // Paint immediately from the cache (the list page already has the client); fill the saved numbers in as soon as they arrive.
+    const cachedPlan = getCachedPlan(id);
+    const cachedClient = getCachedClient(id);
+    if (cachedClient) {
+      apply(cachedPlan || EMPTY, cachedClient);
+      setReady(Boolean(cachedPlan));
+    } else {
+      setClient(null);
+      setReady(false);
+    }
+
     getPlan(id)
-      .then(async (data) => {
-        const c = data.client;
-        if (!c) throw new Error('Client plan not found.');
-        const defaults = {
-          info: {
-            clientName: c.full_name.toUpperCase(),
-            spouseName: '',
-            phone: c.mobile || '',
-            email: c.email || '',
-            address: '',
-            planDate: today(),
-            advisorNotes: '',
-          },
-          insurance: DEFAULT_INSURANCE,
-          retirement: DEFAULT_RETIREMENT,
-        };
-        const plan = fromPlan(data, defaults);
-        setInfo(plan.info);
-        setIncome(plan.income);
-        setExpenses(plan.expenses);
-        setSavings(plan.savings);
-        setAssetData(plan.assetData);
-        setLiabilityData(plan.liabilityData);
-        setInsurance(plan.insurance);
-        setFamily(plan.family);
-        setGoals(plan.goals);
-        setRetirement(plan.retirement);
-        setSaved(JSON.stringify(plan));
-        setClient(c);
+      .then((data) => {
+        if (cancelled) return;
+        if (!data.client) throw new Error('Client plan not found.');
+        apply(data, data.client);
+        setReady(true);
       })
-      .catch((err) => setError(err.message));
+      .catch((err) => { if (!cancelled) setError(err.message); });
+    return () => { cancelled = true; };
   }, [id]);
 
   if (error) return <p className="plan-state plan-state--error" role="alert">{error}</p>;
@@ -209,7 +230,8 @@ export default function ClientPlanPage() {
   ];
 
   return (
-    <div className="plan">
+    // inert: while the saved data is still arriving the page is visible but cannot be edited or saved over it.
+    <div className="plan" {...(ready ? {} : { inert: '', 'aria-busy': true })}>
       <header className="plan__header">
         <button type="button" className="plan__back" onClick={() => navigate('/client-reports')} aria-label="Back to client reports">
           <ArrowLeft size={16} />
@@ -219,7 +241,7 @@ export default function ClientPlanPage() {
           <p className="plan__crumb">Client Reports / {client.plan_name}</p>
           <h1>
             {name}
-            <span className={`plan__status${dirty ? '' : ' plan__status--ok'}`}>{dirty ? 'Unsaved changes' : 'All changes saved'}</span>
+            <span className={`plan__status${dirty ? '' : ' plan__status--ok'}`}>{!ready ? 'Loading saved data…' : dirty ? 'Unsaved changes' : 'All changes saved'}</span>
           </h1>
         </div>
         <div className="plan__actions">

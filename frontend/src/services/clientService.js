@@ -16,10 +16,34 @@ async function authed(path, options = {}) {
   }
 }
 
-export const listClients = () => authed('/clients/');
+// In-memory caches so a plan page can paint instantly from what the list page already fetched,
+// then refresh from the server in the background.
+const clientCache = new Map();
+const planCache = new Map();
 
-export const createClient = (payload) => authed('/clients/', { method: 'POST', body: payload });
+export const getCachedClient = (id) => clientCache.get(String(id)) || planCache.get(String(id))?.client || null;
+export const getCachedPlan = (id) => planCache.get(String(id)) || null;
 
-export const getPlan = (id) => authed(`/clients/${id}/plan/`);
+export const listClients = async () => {
+  const rows = await authed('/clients/');
+  rows.forEach((c) => clientCache.set(String(c.id), c));
+  return rows;
+};
 
-export const savePlan = (id, payload) => authed(`/clients/${id}/plan/`, { method: 'PUT', body: payload });
+export const createClient = async (payload) => {
+  const c = await authed('/clients/', { method: 'POST', body: payload });
+  clientCache.set(String(c.id), c);
+  return c;
+};
+
+export const getPlan = async (id) => {
+  const data = await authed(`/clients/${id}/plan/`);
+  planCache.set(String(id), data);
+  return data;
+};
+
+export const savePlan = async (id, payload) => {
+  const data = await authed(`/clients/${id}/plan/`, { method: 'PUT', body: payload });
+  planCache.set(String(id), { ...data, client: getCachedClient(id) });
+  return data;
+};
