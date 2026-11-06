@@ -24,15 +24,32 @@ const planCache = new Map();
 export const getCachedClient = (id) => clientCache.get(String(id)) || planCache.get(String(id))?.client || null;
 export const getCachedPlan = (id) => planCache.get(String(id)) || null;
 
+// The client list also survives a page refresh (sessionStorage; cleared on sign-out and when the tab closes),
+// so the list page can paint instantly and refresh quietly.
+export const LIST_KEY = 'mns_clients_cache';
+const readList = () => {
+  try { return JSON.parse(sessionStorage.getItem(LIST_KEY)) || null; } catch { return null; }
+};
+const writeList = (rows) => {
+  rows.forEach((c) => clientCache.set(String(c.id), c));
+  try { sessionStorage.setItem(LIST_KEY, JSON.stringify(rows)); } catch { /* storage full or blocked: cache is optional */ }
+};
+
+export const getCachedClients = () => {
+  const rows = readList();
+  if (rows) rows.forEach((c) => clientCache.set(String(c.id), c));
+  return rows;
+};
+
 export const listClients = async () => {
   const rows = await authed('/clients/');
-  rows.forEach((c) => clientCache.set(String(c.id), c));
+  writeList(rows);
   return rows;
 };
 
 export const createClient = async (payload) => {
   const c = await authed('/clients/', { method: 'POST', body: payload });
-  clientCache.set(String(c.id), c);
+  writeList([c, ...(readList() || []).filter((r) => r.id !== c.id)]);
   return c;
 };
 

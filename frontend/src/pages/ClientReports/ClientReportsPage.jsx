@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Search, User, ArrowRight } from 'lucide-react';
 import NewClientModal from '../../components/clients/NewClientModal.jsx';
-import { listClients } from '../../services/clientService.js';
+import { getCachedClients, listClients } from '../../services/clientService.js';
 import './ClientReportsPage.css';
 
 const FILTERS = [
@@ -41,8 +41,10 @@ export default function ClientReportsPage() {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
   const [sort, setSort] = useState('recent');
-  const [clients, setClients] = useState([]);
-  const [loading, setLoading] = useState(true);
+  // Show the last known list immediately; the fresh list replaces it as soon as it arrives.
+  const [cached] = useState(getCachedClients);
+  const [clients, setClients] = useState(() => (cached || []).map(toCard));
+  const [loading, setLoading] = useState(!cached);
   const [loadError, setLoadError] = useState('');
   const [showModal, setShowModal] = useState(false);
   const navigate = useNavigate();
