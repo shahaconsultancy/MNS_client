@@ -1,0 +1,57 @@
+.field { margin-bottom: 20px; }
+
+.field__top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.field__label { font-size: 13px; font-weight: 600; color: var(--color-black); }
+
+.field__box {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 56px;
+  padding: 0 16px;
+  background: var(--color-white);
+  border: 1px solid var(--color-light-gray);
+  border-radius: var(--radius);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.field__box:focus-within {
+  border-color: var(--color-yellow);
+  box-shadow: 0 0 0 3px rgba(194, 144, 53, 0.18);
+}
+
+.field__box--error { border-color: var(--color-error); }
+
+.field__icon { color: var(--color-gray); flex-shrink: 0; }
+
+.field__input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  font-size: 15px;
+  color: var(--color-black);
+}
+
+.field__input::placeholder { color: var(--color-gray); }
+
+.field__toggle {
+  display: grid;
+  place-items: center;
+  padding: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--color-gray);
+  cursor: pointer;
+}
+
+.field__toggle:hover { color: var(--color-blue); }
+
+.field__error { margin: 6px 0 0; font-size: 12px; color: var(--color-error); }
