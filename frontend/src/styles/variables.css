@@ -1,0 +1,14 @@
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+
+:root {
+  --color-blue: #0b1f3d;
+  --color-yellow: #c29035;
+  --color-gray: #737373;
+  --color-white: #ffffff;
+  --color-black: #000000;
+  --color-light-gray: #d9d9d9;
+  --color-error: #b3261e;
+
+  --font-main: 'Montserrat', system-ui, sans-serif;
+  --radius: 10px;
+}
