@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, ChevronDown, Download, FileSpreadsheet, FileText, Save, Upload } from 'lucide-react';
 import { exportExcel, exportPdf } from './exportPlan.js';
 import { readPlanFile } from './importPlan.js';
-import { getPlan, listClients, savePlan } from '../../../services/clientService.js';
+import { getPlan, savePlan } from '../../../services/clientService.js';
 import { fromPlan, toPayload } from './planApi.js';
 import { TABS } from './tabs.js';
 import { inr, pct } from './format.js';
@@ -64,9 +64,9 @@ export default function ClientPlanPage() {
   }, []);
 
   useEffect(() => {
-    listClients()
-      .then(async (rows) => {
-        const c = rows.find((r) => String(r.id) === id);
+    getPlan(id)
+      .then(async (data) => {
+        const c = data.client;
         if (!c) throw new Error('Client plan not found.');
         const defaults = {
           info: {
@@ -81,7 +81,7 @@ export default function ClientPlanPage() {
           insurance: DEFAULT_INSURANCE,
           retirement: DEFAULT_RETIREMENT,
         };
-        const plan = fromPlan(await getPlan(id), defaults);
+        const plan = fromPlan(data, defaults);
         setInfo(plan.info);
         setIncome(plan.income);
         setExpenses(plan.expenses);
