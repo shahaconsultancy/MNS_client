@@ -33,4 +33,5 @@ class ClientPlanView(APIView):
         serializer = PlanSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         save_plan(client, serializer.validated_data)
-        return Response(plan_data(client))
+        # Return the refreshed client too (net worth, surplus, family count) so the list page can update at once.
+        return Response({**plan_data(client), 'client': ClientSerializer(client).data})
