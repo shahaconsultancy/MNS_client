@@ -49,7 +49,9 @@ export const listClients = async () => {
 
 export const createClient = async (payload) => {
   const c = await authed('/clients/', { method: 'POST', body: payload });
-  writeList([c, ...(readList() || []).filter((r) => r.id !== c.id)]);
+  const list = readList();
+  if (list) writeList([c, ...list.filter((r) => r.id !== c.id)]);
+  else clientCache.set(String(c.id), c);
   return c;
 };
 
@@ -61,6 +63,11 @@ export const getPlan = async (id) => {
 
 export const savePlan = async (id, payload) => {
   const data = await authed(`/clients/${id}/plan/`, { method: 'PUT', body: payload });
-  planCache.set(String(id), { ...data, client: getCachedClient(id) });
+  planCache.set(String(id), data);
+  const list = readList();
+  if (data.client && list) {
+    // Keep the remembered client list in step with what was just saved, so the card never shows old figures.
+    writeList(list.map((c) => (c.id === data.client.id ? data.client : c)));
+  }
   return data;
 };
