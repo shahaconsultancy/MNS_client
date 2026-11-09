@@ -152,7 +152,7 @@ class CleanupPolicyTests(PortfolioCacheMixin, SimpleTestCase):
     def test_status_kept_during_its_retry_wait_and_removed_once_long_expired(self):
         now = datetime.now(timezone.utc)
         cooling = _portfolio_dir(HDFC_LARGE) / 'status.json'
-        _write_json_atomic(cooling, {'status': 'SOURCE_NOT_SUPPORTED', 'last_checked_at': (now - timedelta(days=40)).isoformat(), 'next_check_at': (now + timedelta(days=1)).isoformat()})
+        _write_json_atomic(cooling, {'status': 'SOURCE_NOT_SUPPORTED', 'matcher_version': ps.MATCHER_VERSION,'last_checked_at': (now - timedelta(days=40)).isoformat(), 'next_check_at': (now + timedelta(days=1)).isoformat()})
         expired = _portfolio_dir(SBI_LARGE) / 'status.json'
         _write_json_atomic(expired, {'status': 'SOURCE_NOT_SUPPORTED', 'last_checked_at': (now - timedelta(days=40)).isoformat(), 'next_check_at': (now - timedelta(days=33)).isoformat()})
         for path in (cooling, expired):

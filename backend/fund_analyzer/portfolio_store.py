@@ -26,6 +26,7 @@ from typing import Any
 from django.conf import settings
 
 from .adapters import (
+    AMBIGUOUS_MAPPING,
     AMC_SOURCES,
     DISCLOSURE_NOT_PUBLISHED,
     DOWNLOAD_BLOCKED,
@@ -72,12 +73,17 @@ RETRY_DELAYS = {
     DOWNLOAD_BLOCKED: timedelta(hours=24),
     SOURCE_NOT_SUPPORTED: timedelta(days=7),
     SCHEME_NOT_FOUND: timedelta(days=1),
+    AMBIGUOUS_MAPPING: timedelta(days=1),
     INVALID_WORKBOOK: timedelta(days=1),
     PARSING_FAILED: timedelta(days=1),
     DISCLOSURE_NOT_PUBLISHED: timedelta(hours=6),
 }
 MAX_RETRY_DELAY = timedelta(hours=24)
 NEEDS_ADMIN = (SOURCE_NOT_SUPPORTED, DOWNLOAD_BLOCKED, INVALID_WORKBOOK, SCHEME_NOT_FOUND, PARSING_FAILED)
+# Raise this whenever scheme/sheet matching improves. A failure recorded by an older matcher is retried at once,
+# once, instead of waiting out its back-off. Funds that are available, and other cache files, are untouched.
+MATCHER_VERSION = 2
+RETRY_WITH_NEW_MATCHER = (SOURCE_NOT_SUPPORTED, INVALID_WORKBOOK, SCHEME_NOT_FOUND, PARSING_FAILED, AMBIGUOUS_MAPPING)
 
 
 def _slug(value: str) -> str:
@@ -354,7 +360,10 @@ def _read_status(record: dict[str, Any]) -> dict[str, Any]:
 
 def discovery_due(record: dict[str, Any]) -> bool:
     """False while a source was checked recently, or is backing off after a failure."""
-    next_check = _read_status(record).get('next_check_at')
+    current = _read_status(record)
+    if current.get('status') in RETRY_WITH_NEW_MATCHER and current.get('matcher_version') != MATCHER_VERSION:
+        return True
+    next_check = current.get('next_check_at')
     if not next_check:
         return True
     try:
@@ -388,6 +397,7 @@ def record_status(record: dict[str, Any], status: str, detail: str = '', latest_
             'portfolio_key': portfolio_key(record),
             'scheme_name': record.get('scheme_name') or '',
             'status': status,
+            'matcher_version': MATCHER_VERSION,
             'detail': detail[:2000],
             'failures': failures,
             'latest_month': latest_month or current.get('latest_month') or '',

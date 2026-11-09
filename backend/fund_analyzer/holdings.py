@@ -20,6 +20,7 @@ from .adapters import (
     AMC_SOURCES,
     DISCLOSURE_NOT_PUBLISHED,
     DOWNLOAD_BLOCKED,
+    AMBIGUOUS_MAPPING,
     DOWNLOAD_FAILED,
     HOLDINGS_AVAILABLE,
     INVALID_WORKBOOK,
@@ -33,7 +34,7 @@ from .adapters import (
     classify_error,
     is_official_url,
     month_in_text as _month_in_text,
-    normalise_name as _normalise_name,
+    comparable_name as _normalise_name,
     official_domains,
     portfolio_date as _portfolio_date,
     source_for_amc,
@@ -63,7 +64,9 @@ REASON_SOURCE_NOT_SUPPORTED = 'SOURCE_NOT_SUPPORTED'
 REASON_FILE_UNAVAILABLE = 'OFFICIAL_FILE_UNAVAILABLE'
 REASON_DOWNLOAD_BLOCKED = 'DOWNLOAD_BLOCKED'
 REASON_SCHEME_NOT_IN_FILES = 'SCHEME_NOT_IN_OFFICIAL_FILES'
+REASON_AMBIGUOUS_MAPPING = 'AMBIGUOUS_SCHEME_MAPPING'
 REASON_MESSAGES = {
+    REASON_AMBIGUOUS_MAPPING: 'More than one portfolio in the AMC file could be this scheme. It needs a developer review',
     REASON_SCHEME_NOT_IN_FILES: 'Scheme not found in the AMC published portfolio files',
     REASON_FILE_UNAVAILABLE: 'Official file unavailable',
     REASON_DOWNLOAD_BLOCKED: 'Download blocked by the AMC website',
@@ -483,6 +486,15 @@ def _download_cached(amc_key: str, month: str, url: str) -> bytes:
         return payload
 
 
+def _scheme_title(frame: pd.DataFrame) -> str:
+    """The name a sheet gives its own scheme, from a 'Scheme Name :' row, normalised. '' when there is none."""
+    for row_index in range(min(len(frame), 8)):
+        cells = [str(value).strip() for value in frame.iloc[row_index].tolist() if not pd.isna(value) and str(value).strip()]
+        if len(cells) > 1 and re.sub(r'[^a-z]+', ' ', cells[0].lower()).strip() in ('scheme name', 'name of the scheme', 'name of scheme'):
+            return _normalise_name(cells[1])
+    return ''
+
+
 def _sheet_name_score(sheet_name: str, frame: pd.DataFrame, fund_name: str) -> int:
     has_holdings_header = any(
         'isin' in ' '.join(str(value).lower() for value in frame.iloc[row_index].tolist())
@@ -492,10 +504,13 @@ def _sheet_name_score(sheet_name: str, frame: pd.DataFrame, fund_name: str) -> i
         return 0
     wanted = _normalise_name(fund_name)
     sheet_title = _normalise_name(sheet_name)
+    title = _normalise_name(' '.join(frame.iloc[:3, :12].fillna('').astype(str).to_numpy().ravel()))
+    # The scheme's own title written out in full is the strongest evidence, ahead of a longer name that merely contains it.
+    if wanted and wanted in (sheet_title, _scheme_title(frame)):
+        return 3.5
     if wanted and wanted in sheet_title:
         return 3
     # A sheet's title beats a mention lower down, such as one fund holding units of another.
-    title = _normalise_name(' '.join(frame.iloc[:3, :12].fillna('').astype(str).to_numpy().ravel()))
     if wanted and wanted in title:
         return 2.5
     context = frame.iloc[:25, :12].fillna('').astype(str).to_numpy().ravel()
@@ -670,7 +685,15 @@ def _locate_holdings_table(
     if not ranked or ranked[0][0] == 0:
         # A file name proves nothing. The workbook itself must name this scheme.
         raise ProviderError(f'No sheet matched fund {fund_name}')
-    _, sheet_name, frame = ranked[0]
+    top_score, sheet_name, frame = ranked[0]
+    # Two different schemes tied at title level: choosing one would be a guess, so the mapping is refused.
+    tied = [(name, _scheme_title(f) or _normalise_name(name)) for score, name, f in ranked if score == top_score]
+    if top_score >= 2.5 and len({title for _, title in tied}) > 1:
+        names = [name for name, _ in tied][:6]
+        if diagnostics is not None:
+            diagnostics['ambiguous_candidates'] = names
+        logger.warning('Ambiguous scheme mapping for %s. Candidate sheets: %s', fund_name, names)
+        raise ProviderError(f'Ambiguous scheme mapping for {fund_name}: candidates {names}')
     if diagnostics is not None:
         diagnostics['matched_sheet_name'] = sheet_name
         diagnostics['reporting_date'] = _reporting_date_from_frame(frame)
@@ -1841,6 +1864,8 @@ def _fund_reason_code(fund: dict[str, Any]) -> str | None:
         return REASON_DOWNLOAD_BLOCKED
     if status == SCHEME_NOT_FOUND:
         return REASON_SCHEME_NOT_IN_FILES
+    if status == AMBIGUOUS_MAPPING:
+        return REASON_AMBIGUOUS_MAPPING
     if status in (DISCLOSURE_NOT_PUBLISHED, DOWNLOAD_FAILED):
         return REASON_FILE_UNAVAILABLE
     return REASON_HOLDINGS_UNAVAILABLE

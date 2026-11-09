@@ -20,6 +20,7 @@ DOWNLOAD_BLOCKED = 'DOWNLOAD_BLOCKED'
 DOWNLOAD_FAILED = 'DOWNLOAD_FAILED'
 INVALID_WORKBOOK = 'INVALID_WORKBOOK'
 SCHEME_NOT_FOUND = 'SCHEME_NOT_FOUND'
+AMBIGUOUS_MAPPING = 'AMBIGUOUS_MAPPING'
 PARSING_FAILED = 'PARSING_FAILED'
 NO_COMMON_MONTH = 'NO_COMMON_MONTH'
 HOLDINGS_AVAILABLE = 'HOLDINGS_AVAILABLE'
@@ -60,6 +61,8 @@ def classify_error(error: Exception | str) -> str:
         return DOWNLOAD_BLOCKED
     if re.search(r'\b(404|410)\b|not found for url|no monthly portfolio|no monthly files', text):
         return DISCLOSURE_NOT_PUBLISHED
+    if 'ambiguous scheme mapping' in text:
+        return AMBIGUOUS_MAPPING
     if re.search(r'no sheet matched|no holdings section', text):
         return SCHEME_NOT_FOUND
     if re.search(r'could not be parsed|not a zip|badzip|workbook contains no sheets|unsupported format|xlrd|corrupt', text):
@@ -75,9 +78,17 @@ def normalise_name(value: str) -> str:
     return re.sub(r'[^a-z0-9]+', ' ', text.lower()).strip()
 
 
+def comparable_name(value: str) -> str:
+    """normalise_name for matching a scheme to a sheet or link, never for cache keys or folder names.
+
+    AMFI writes "Small Cap" where SBI's own file writes "Smallcap", so those must compare equal.
+    """
+    return re.sub(r'\b(small|mid|large|multi|flexi) cap\b', r'\1cap', normalise_name(value))
+
+
 def scheme_link_matches(text: str, fund_name: str) -> bool:
-    wanted = normalise_name(fund_name)
-    candidate = normalise_name(unquote(text))
+    wanted = comparable_name(fund_name)
+    candidate = comparable_name(unquote(text))
     return bool(wanted and (wanted in candidate or candidate in wanted))
 
 
