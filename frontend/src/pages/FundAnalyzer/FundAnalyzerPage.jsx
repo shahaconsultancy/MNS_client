@@ -19,7 +19,7 @@ const TABS = [
 
 // The selection survives a page refresh. Each signed-in user has their own, and only Clear all forgets it.
 const storageKey = () => `mns_fund_analyzer:${getUserEmail() || 'guest'}`;
-const FUND_FIELDS = ['scheme_code', 'scheme_name', 'amc', 'category', 'plan', 'option', 'isin'];
+const FUND_FIELDS = ['scheme_code', 'scheme_name', 'display_name', 'amc', 'category', 'plan', 'option', 'isin'];
 
 function readSaved() {
   try {

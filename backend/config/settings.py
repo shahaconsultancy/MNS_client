@@ -117,6 +117,12 @@ if 'test' in sys.argv:
     # Tests must never touch the real cache.
     FUND_ANALYZER_HOLDINGS_CACHE_DIR = tempfile.mkdtemp(prefix='mns-test-portfolio-cache-')
 
+# The searchable AMFI scheme list. It is downloaded again once it is this old, and a download with
+# fewer schemes than the minimum, or a fall larger than the percentage, is rejected and not used.
+FUND_ANALYZER_AMFI_REGISTRY_REFRESH_HOURS = max(1.0, float(os.getenv('FUND_ANALYZER_AMFI_REGISTRY_REFRESH_HOURS', '12')))
+FUND_ANALYZER_AMFI_REGISTRY_MIN_SCHEMES = max(1, int(os.getenv('FUND_ANALYZER_AMFI_REGISTRY_MIN_SCHEMES', '5000')))
+FUND_ANALYZER_AMFI_REGISTRY_MAX_DROP_PCT = min(100.0, max(0.0, float(os.getenv('FUND_ANALYZER_AMFI_REGISTRY_MAX_DROP_PCT', '10'))))
+
 REDIS_URL = os.getenv('REDIS_URL')
 if REDIS_URL:
     CACHES = {

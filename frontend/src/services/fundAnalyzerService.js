@@ -1,7 +1,7 @@
 import axiosClient from './axiosClient.js';
 
-export async function searchFunds(query) {
-  const { data } = await axiosClient.get('/search', { params: { q: query } });
+export async function searchFunds(query, { offset = 0, limit = 50 } = {}) {
+  const { data } = await axiosClient.get('/search', { params: { q: query, offset, limit } });
   return data;
 }
 

@@ -113,6 +113,26 @@ def _clean(value: Any) -> str | None:
     return value if value and value != '-' else None
 
 
+def _name_words(value: Any) -> str:
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', str(value or '').lower()).split())
+
+
+def scheme_display_name(record: dict[str, Any]) -> str:
+    """The scheme as investors read it: name, then plan, then option, e.g. 'X Fund - Regular Plan - Growth'.
+
+    AMFI's current NAVAll.txt carries plan and option in their own columns; older rows fold them
+    into the name. A plan or option the name already states is not repeated.
+    """
+    name = ' '.join(str(record.get('scheme_name') or '').split())
+    parts = [name] if name else []
+    for extra in (record.get('plan'), record.get('option')):
+        extra = ' '.join(str(extra or '').split())
+        words = _name_words(extra)
+        if words and f' {words} ' not in f" {_name_words(' '.join(parts))} ":
+            parts.append(extra)
+    return ' - '.join(parts) or str(record.get('scheme_code') or '')
+
+
 def _category_from_header(value: str) -> tuple[str | None, str | None]:
     match = re.match(r'(?P<type>Open|Close|Interval)\s+Ended\s+Schemes?\s*\(\s*(?P<category>.*?)\s*\)', value, re.I)
     if not match:
@@ -120,7 +140,13 @@ def _category_from_header(value: str) -> tuple[str | None, str | None]:
     return match.group('type').title(), match.group('category') or None
 
 
-def parse_amfi_text_data(text: str) -> list[dict[str, Any]]:
+def parse_amfi_text_data(text: str, *, include_unpriced: bool = False) -> list[dict[str, Any]]:
+    """Scheme rows of NAVAll.txt with the AMC and category from the section headings above them.
+
+    By default a row whose NAV is zero or not a number is skipped, because analysis needs a price.
+    The search registry passes include_unpriced=True: such a row is still a real AMFI scheme code
+    (segregated portfolios publish 0), so it is kept with nav None.
+    """
     records: list[dict[str, Any]] = []
     amc: str | None = None
     scheme_type: str | None = None
@@ -147,14 +173,22 @@ def parse_amfi_text_data(text: str) -> list[dict[str, Any]]:
                 plan = option = ''
             else:
                 continue
-            value = float(nav.replace(',', ''))
-            if value <= 0:
-                continue
-            records.append({
+            try:
+                value: float | None = float(nav.replace(',', ''))
+            except ValueError:
+                value = None
+            if value is None or value <= 0:
+                if not include_unpriced:
+                    continue
+                value = None
+            record = {
                 'scheme_code': code, 'isin': _clean(isin_growth) or _clean(isin_reinvest), 'isin_reinvest': _clean(isin_reinvest),
+                'isin_payout_growth': _clean(isin_growth),
                 'scheme_name': name, 'plan': _clean(plan), 'option': _clean(option), 'nav': value,
                 'date': nav_date, 'amc': amc, 'scheme_type': scheme_type, 'category': category,
-            })
+            }
+            record['display_name'] = scheme_display_name(record)
+            records.append(record)
         except (TypeError, ValueError):
             continue
     if not records:

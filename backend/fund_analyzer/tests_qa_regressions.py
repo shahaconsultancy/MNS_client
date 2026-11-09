@@ -8,6 +8,7 @@ from rest_framework.test import APIClient
 
 from . import providers
 from .providers import ProviderError
+from .scheme_registry import registry_from_records
 from .services import search_funds
 
 LOCMEM = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache', 'LOCATION': 'qa-regressions'}}
@@ -22,7 +23,7 @@ class SearchWordsTests(SimpleTestCase):
     """QA-3: search matched only the exact phrase, so word order and AMFI's double spaces hid real funds."""
 
     def search(self, query):
-        with patch('fund_analyzer.services.fetch_amfi_latest', return_value=RECORDS):
+        with patch('fund_analyzer.services.get_registry', return_value=registry_from_records(RECORDS)):
             return [row['scheme_code'] for row in search_funds(query)['results']]
 
     def test_words_in_any_order_find_the_fund(self):
@@ -43,7 +44,7 @@ class SearchWordsTests(SimpleTestCase):
             {**RECORDS[2], 'scheme_code': '5', 'scheme_name': 'Navi HDFC Large Cap Index'},
             RECORDS[2],
         ]
-        with patch('fund_analyzer.services.fetch_amfi_latest', return_value=records):
+        with patch('fund_analyzer.services.get_registry', return_value=registry_from_records(records)):
             self.assertEqual([row['scheme_code'] for row in search_funds('HDFC Large Cap')['results']], ['3', '5', '4'])
 
     def test_every_word_must_match(self):
@@ -108,7 +109,7 @@ class ErrorResponseTests(SimpleTestCase):
         self.assertIn('temporarily unavailable', response.json()['detail'])
 
     def test_search_failure_shows_a_plain_message(self):
-        with patch('fund_analyzer.services.fetch_amfi_latest', side_effect=ProviderError(self.INTERNAL)):
+        with patch('fund_analyzer.services.get_registry', side_effect=ProviderError(self.INTERNAL)):
             self.assert_clean(self.client.get('/api/search', {'q': 'hdfc'}))
 
     def test_compare_failure_shows_a_plain_message(self):
@@ -120,7 +121,7 @@ class ErrorResponseTests(SimpleTestCase):
             self.assert_clean(self.client.post('/api/fundamentals', {'scheme_codes': ['1']}, format='json'))
 
     def test_the_provider_detail_still_reaches_the_log(self):
-        with patch('fund_analyzer.services.fetch_amfi_latest', side_effect=ProviderError(self.INTERNAL)), self.assertLogs('fund_analyzer.views', 'WARNING') as logs:
+        with patch('fund_analyzer.services.get_registry', side_effect=ProviderError(self.INTERNAL)), self.assertLogs('fund_analyzer.views', 'WARNING') as logs:
             self.client.get('/api/search', {'q': 'hdfc'})
         self.assertIn('Read timed out', logs.output[0])
 

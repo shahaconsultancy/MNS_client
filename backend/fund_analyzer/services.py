@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from time import perf_counter
@@ -22,6 +23,7 @@ from .providers import (
     parse_amfi_text_data,
     parse_mfapi,
 )
+from .scheme_registry import get_registry, registry_status
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,21 @@ def _base_detail(record: dict[str, Any], *, source: str, as_of: str | None) -> d
     }
 
 
+def _metrics_or_reason(history: list[dict[str, Any]], risk_free_rate: float, scheme_code: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Metrics for a usable NAV history, or None and the reason.
+
+    A zero or negative NAV is not a price (segregated portfolios publish 0), and returns over it
+    are undefined, so such a history gets no metrics instead of failing the whole comparison.
+    Every other history goes to metrics() unchanged.
+    """
+    if not history:
+        return None, None
+    if any(not isinstance(row.get('nav'), (int, float)) or row['nav'] <= 0 for row in history):
+        logger.warning('Scheme %s has zero or negative NAVs in its history; returns and risk are not calculated', scheme_code)
+        return None, 'Returns and risk are not available: this scheme reports a zero NAV (for example a segregated portfolio).'
+    return metrics(history, risk_free_rate), None
+
+
 def _today_window() -> tuple[date, date]:
     end = date.today()
     return end - timedelta(days=365 * 5 + 7), end
@@ -85,7 +102,7 @@ def fetch_fund_data(scheme_code: str, *, risk_free_rate: float = 0.065, include_
             aum, aum_as_of = aum_data if aum_data is not None else fetch_amfi_aum(latest.get('scheme_name') or '', latest.get('amc') or '')
         result = _base_detail(latest, source='AMFI', as_of=latest.get('date'))
         result.update({'ter': ter, 'ter_as_of': ter_as_of, 'aum': aum, 'aum_unit': 'lakhs' if aum is not None else None, 'aum_as_of': aum_as_of, 'history': history})
-        result['metrics'] = metrics(history, risk_free_rate) if history else None
+        result['metrics'], result['metrics_unavailable'] = _metrics_or_reason(history, risk_free_rate, scheme_code)
         return result
     except (ProviderError, ValueError, TypeError, KeyError) as exc:
         logger.warning('AMFI fallback for scheme %s: %s', scheme_code, exc)
@@ -101,30 +118,88 @@ def fetch_fund_data(scheme_code: str, *, risk_free_rate: float = 0.065, include_
             latest = history[-1]
             result = _base_detail({**meta, **latest}, source='MFAPI (backup)', as_of=latest.get('date'))
             result.update({'ter': None, 'ter_as_of': None, 'aum': None, 'aum_unit': None, 'aum_as_of': None, 'history': history})
-            result['metrics'] = metrics(history, risk_free_rate) if history else None
+            result['metrics'], result['metrics_unavailable'] = _metrics_or_reason(history, risk_free_rate, scheme_code)
             return result
         except (ProviderError, ValueError, TypeError, KeyError) as backup_exc:
             logger.error('AMFI and MFAPI failed for scheme %s: %s', scheme_code, backup_exc)
             raise ProviderError(f'Unable to load scheme {scheme_code} from AMFI or MFAPI') from backup_exc
 
 
-def search_funds(query: str, limit: int = 25) -> dict[str, Any]:
-    records = fetch_amfi_latest()
-    # Every word must appear, in any order. AMFI names sometimes carry repeated spaces, so spacing is ignored.
-    words = query.lower().split()
-    filtered = [
-        record for record in records
-        if all(word in ' '.join(' '.join(str(record.get(key) or '') for key in ('scheme_name', 'scheme_code', 'isin', 'amc', 'category')).lower().split()) for word in words)
-    ]
-    filtered = [record for record in filtered if _is_direct_growth(record)] or filtered
-    # The typed phrase itself, then names starting with it, ahead of names that only contain every word.
-    phrase = ' '.join(words)
-    def rank(record):
-        name = ' '.join(str(record.get('scheme_name') or '').lower().split())
-        return (not name.startswith(phrase), phrase not in name)
-    filtered.sort(key=rank)
-    as_of = max((record.get('date') for record in filtered if record.get('date')), default=None)
-    return {'source': 'AMFI', 'asOfDate': _iso_date(as_of), 'results': filtered[:limit]}
+SEARCH_RESULT_LIMIT = 50
+# AMFI spells IDCW out in full on some rows and older rows still say Dividend.
+_IDCW_LONG = re.compile(r'income\s+distribution\s+cum\s+capital\s+withdrawal')
+_QUERY_ALTERNATIVES = {'idcw': ('idcw', 'dividend', 'payout', 'reinvest'), 'dividend': ('idcw', 'dividend'), 'div': ('idcw', 'div')}
+# Words people add that AMFI does not always print ("Direct Plan" vs "- Direct -").
+_FILLER_WORDS = {'plan', 'option', 'scheme', 'opt'}
+
+
+def _search_norm(value: Any) -> str:
+    # The words are kept beside 'idcw', so either spelling, in any word order, still matches.
+    text = _IDCW_LONG.sub(lambda match: f'{match.group(0)} idcw ', str(value or '').lower().replace('&', ' and '))
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', text).split())
+
+
+def _plan_rank(record: dict[str, Any]) -> int:
+    text = f"{record.get('plan') or ''} {record.get('scheme_name') or ''}".lower()
+    return 0 if re.search(r'\bdirect\b', text) else 1 if re.search(r'\bregular\b', text) else 2
+
+
+def _option_rank(record: dict[str, Any]) -> int:
+    text = _search_norm(f"{record.get('option') or ''} {record.get('scheme_name') or ''}")
+    return 1 if re.search(r'\b(idcw|dividend|payout|reinvest\w*)\b', text) else 0 if re.search(r'\bgrowth\b', text) else 2
+
+
+MAX_SEARCH_PAGE = 100
+
+
+def _search_result(record: dict[str, Any], display: str) -> dict[str, Any]:
+    state = scheme_status(record)
+    return {**record, 'display_name': display, 'scheme_status': state['status'], 'last_nav_date': state['last_nav_date'], 'nav_date': record.get('date')}
+
+
+def search_funds(query: str, limit: int = SEARCH_RESULT_LIMIT, offset: int = 0) -> dict[str, Any]:
+    """Every AMFI scheme whose name, plan, option, code, ISIN, AMC or category holds every typed word.
+
+    The whole registry is matched and ranked first; offset and limit only page through that full,
+    ranked list, and total counts every match. Each plan and option is its own scheme code, so no
+    Regular, IDCW, inactive or unpriced scheme is dropped; Direct Growth only sorts first.
+    """
+    registry = get_registry()
+    limit = max(1, min(int(limit), MAX_SEARCH_PAGE))
+    offset = max(0, int(offset))
+    meta = {'source': 'AMFI', 'registry': registry_status(), 'offset': offset, 'limit': limit}
+    # An exact scheme code or ISIN means that scheme.
+    key = ''.join(query.split()).upper()
+    exact = ([registry.by_code[key]] if key in registry.by_code else []) or registry.by_isin.get(key, [])
+    if exact:
+        page = [_search_result(record, record['display_name']) for record in exact[offset:offset + limit]]
+        return {**meta, 'asOfDate': _iso_date(exact[0].get('date')), 'total': len(exact), 'results': page}
+
+    phrase = _search_norm(query)
+    words = phrase.split()
+    required = [word for word in words if word not in _FILLER_WORDS] or words
+    if not required:
+        return {**meta, 'asOfDate': None, 'total': 0, 'results': []}
+    alternatives = [_QUERY_ALTERNATIVES.get(word, (word,)) for word in required]
+    matched = []
+    for record, (display, haystack, compact, display_norm, name_norm) in zip(registry.records, registry.search_rows):
+        # Every word must appear, in any order. Spacing is ignored too, so 'mid cap' finds 'Midcap' and back.
+        if all(any(alt in haystack or alt in compact for alt in options) for options in alternatives):
+            matched.append((record, display, display_norm, name_norm))
+
+    # The typed phrase itself, then names starting with it, then names containing it, then names
+    # that only hold every word. Live schemes before wound-up ones; Direct Growth first within a fund.
+    def rank(item):
+        record, _, display_norm, name_norm = item
+        return (
+            phrase not in (display_norm, name_norm), not display_norm.startswith(phrase), phrase not in display_norm,
+            scheme_status(record)['status'] != 'ACTIVE', record.get('nav') is None, len(name_norm.split()), name_norm,
+            _plan_rank(record), _option_rank(record), str(record.get('scheme_code')),
+        )
+    matched.sort(key=rank)
+    page = [_search_result(record, display) for record, display, _, _ in matched[offset:offset + limit]]
+    as_of = max((record.get('date') for record in page if record.get('date')), default=None)
+    return {**meta, 'asOfDate': _iso_date(as_of), 'total': len(matched), 'results': page}
 
 
 def compare_funds(scheme_codes: list[str], risk_free_rate: float = 0.065) -> dict[str, Any]:

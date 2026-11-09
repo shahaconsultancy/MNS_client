@@ -13,6 +13,11 @@ class SourceSerializer(serializers.Serializer):
 class FundSearchResultSerializer(SourceSerializer):
     scheme_code = serializers.CharField()
     scheme_name = serializers.CharField()
+    display_name = serializers.CharField(allow_null=True, required=False)
+    isin_reinvest = serializers.CharField(allow_null=True, required=False)
+    nav_date = serializers.CharField(allow_null=True, required=False)
+    scheme_status = serializers.CharField(allow_null=True, required=False)
+    last_nav_date = serializers.CharField(allow_null=True, required=False)
     amc = serializers.CharField(allow_null=True, required=False)
     category = serializers.CharField(allow_null=True, required=False)
     scheme_type = serializers.CharField(allow_null=True, required=False)
@@ -23,6 +28,10 @@ class FundSearchResultSerializer(SourceSerializer):
 
 
 class FundSearchResponseSerializer(SourceSerializer):
+    total = serializers.IntegerField(required=False)
+    offset = serializers.IntegerField(required=False)
+    limit = serializers.IntegerField(required=False)
+    registry = serializers.DictField(required=False)
     results = FundSearchResultSerializer(many=True)
 
 
@@ -69,6 +78,7 @@ class FundDetailSerializer(SourceSerializer):
     riskometer = serializers.DictField(allow_null=True, required=False)
     asset_class = serializers.CharField(allow_null=True, required=False)
     metrics = MetricSetSerializer(allow_null=True, required=False)
+    metrics_unavailable = serializers.CharField(allow_null=True, required=False)
 
 
 class CompareRequestSerializer(serializers.Serializer):

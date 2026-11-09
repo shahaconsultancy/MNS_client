@@ -1,9 +1,11 @@
 from django.urls import path
 
-from .views import FundCompareView, FundDetailView, FundFundamentalsView, FundOverlapImportView, FundOverlapJobStatusView, FundOverlapJobView, FundOverlapView, FundSearchView, PortfolioCoverageView
+from .views import FundCompareView, FundDetailView, FundFundamentalsView, FundOverlapImportView, FundOverlapJobStatusView, FundOverlapJobView, FundOverlapView, FundSearchView, PortfolioCoverageView, SchemeRegistryRefreshView, SchemeRegistryView
 
 urlpatterns = [
     path('search', FundSearchView.as_view(), name='fund-search'),
+    path('search/registry', SchemeRegistryView.as_view(), name='fund-search-registry'),
+    path('search/registry/refresh', SchemeRegistryRefreshView.as_view(), name='fund-search-registry-refresh'),
     path('funds/<str:scheme_code>', FundDetailView.as_view(), name='fund-detail'),
     path('compare', FundCompareView.as_view(), name='fund-compare'),
     path('fundamentals', FundFundamentalsView.as_view(), name='fund-fundamentals'),
