@@ -95,7 +95,9 @@ FUND_ANALYZER_PORTFOLIO_LOOKBACK_MONTHS = max(1, int(os.getenv('FUND_ANALYZER_PO
 # Backup holdings source: Charlie Alpha, an independent third-party API. OFF unless switched on, because
 # its terms say "education and research" and grant no commercial redistribution rights. Turn it on only
 # after permission and accuracy have been verified. The official AMC reader works the same either way.
-FUND_ANALYZER_CHARLIE_ALPHA_ENABLED = os.getenv('FUND_ANALYZER_CHARLIE_ALPHA_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
+# On by default at the owner's decision (11 Nov 2026), so the order is AMFI -> AMC -> Charlie Alpha ->
+# unavailable everywhere. Set FUND_ANALYZER_CHARLIE_ALPHA_ENABLED=false to switch the backup off.
+FUND_ANALYZER_CHARLIE_ALPHA_ENABLED = os.getenv('FUND_ANALYZER_CHARLIE_ALPHA_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 FUND_ANALYZER_CHARLIE_ALPHA_URL = os.getenv('FUND_ANALYZER_CHARLIE_ALPHA_URL', 'https://api.charliealpha.in/v1').rstrip('/')
 # Upper bound on backup requests for one Update Analysis, so a large selection cannot flood the provider.
 # The backup source may supply only the newest of these completed months (October back to July on 6 November 2026).
