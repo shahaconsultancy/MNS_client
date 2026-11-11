@@ -1,0 +1,147 @@
+{
+ "schema": 1,
+ "about": "Verified AMC monthly-portfolio sources. An entry here overrides the page AMFI's directory lists for that AMC. Change an entry only after checking the source by hand; any change re-opens every fund of that AMC whose last retrieval failed. 'discovery' says how files are found: html_links (Excel or ZIP links on a public page), wordpress_ajax_listing and json_downloads_api (the public listing the AMC's own page calls), manual_import (no automated source: staff upload, or the authorised backup).",
+ "amcs": {
+  "ICICI Prudential Mutual Fund": {
+   "key": "icici-prudential-mutual-fund",
+   "aliases": [
+    "ICICI Prudential",
+    "ICICI Pru"
+   ],
+   "website": "https://www.icicipruamc.com",
+   "url": "https://www.icicipruamc.com/media-center/downloads",
+   "parser": "json_downloads_api",
+   "domains": [
+    "icicipruamc.com"
+   ],
+   "formats": [
+    "zip"
+   ],
+   "layout": "per_scheme_archive",
+   "listing": {
+    "categories_url": "https://apimf.icicipruamc.com/nms/v1/downloads/categories?userType=Investor",
+    "files_url": "https://apimf.icicipruamc.com/nms/v1/downloads/files",
+    "category_code": "MONTHLY_PORTFOLIO_DISCSLO_DWND",
+    "file_base": "https://www.icicipruamc.com/blob",
+    "headers": {
+     "env": "api"
+    },
+    "page_size": 20
+   },
+   "verified_at": "2026-11-10",
+   "notes": "The AMFI-listed page (news-and-media/downloads?...MonthlyPortfolioDisclosures) returns 404 since ICICI moved to a JavaScript site. Its public downloads API lists one ZIP a month holding one workbook per scheme."
+  },
+  "Bajaj Finserv Mutual Fund": {
+   "key": "bajaj-finserv-mutual-fund",
+   "aliases": [
+    "Bajaj Finserv"
+   ],
+   "website": "https://www.bajajamc.com",
+   "url": "https://www.bajajamc.com/downloads?statutory-disclosures=",
+   "parser": "wordpress_ajax_listing",
+   "domains": [
+    "bajajamc.com"
+   ],
+   "formats": [
+    "xls",
+    "xlsx"
+   ],
+   "layout": "combined_workbook",
+   "listing": {
+    "config_object": "bajajDownloads",
+    "section_title": "Monthly Portfolio",
+    "section_id": "757",
+    "filter_action": "bajaj_get_filter_options",
+    "list_action": "bajaj_get_downloads",
+    "financial_year": "april"
+   },
+   "verified_at": "2026-11-10",
+   "notes": "The page fills its Monthly Portfolio list from WordPress admin-ajax, using a nonce the page publishes to every visitor. One combined workbook a month."
+  },
+  "DSP Mutual Fund": {
+   "key": "dsp-mutual-fund",
+   "aliases": [
+    "DSP",
+    "DSP BlackRock"
+   ],
+   "website": "https://www.dspim.com",
+   "url": "https://www.dspim.com/mandatory-disclosures/portfolio-disclosures",
+   "parser": "directory_monthly_excel",
+   "domains": [
+    "dspim.com"
+   ],
+   "formats": [
+    "zip",
+    "xlsx"
+   ],
+   "layout": "combined_archive",
+   "verified_at": "2026-11-10",
+   "notes": "Month-end portfolios are ZIP files holding a debt workbook and an equity/FoF workbook. Before ZIP support they were skipped, which was recorded as SOURCE_NOT_SUPPORTED."
+  },
+  "Edelweiss Mutual Fund": {
+   "key": "edelweiss-mutual-fund",
+   "aliases": [
+    "Edelweiss"
+   ],
+   "website": "https://www.edelweissmf.com",
+   "url": "https://www.edelweissmf.com/statutory#Portfolio-of-Schemes",
+   "parser": "manual_import",
+   "access": "restricted",
+   "domains": [
+    "edelweissmf.com"
+   ],
+   "formats": [
+    "xlsx"
+   ],
+   "verified_at": "2026-11-10",
+   "notes": "The statutory web page (www.edelweissmf.com/statutory) answers HTTP 200 and its JavaScript files load (HTTP 200), so the website itself is reachable. The page builds its file list from the public statutory-menus data API (api.edelweissmf.com/edelweissmf/api/v1/mf/statutory-menus), which answered HTTP 403 Access Denied from Akamai to the backend (10 Nov 2026). The file list and the October 2026 holdings could therefore not be retrieved automatically. AMFI's directory links only to the same statutory page. No automated retrieval is attempted and the 403 is not worked around: use a staff upload of the AMC's monthly file, or the authorised backup.",
+   "restricted_route": "data_api",
+   "evidence": {
+    "checked_at": "2026-11-10",
+    "client": "backend HTTP client (Python requests, User-Agent MNS-Fund-Analyzer/1.0)",
+    "statutory_page": {
+     "url": "https://www.edelweissmf.com/statutory",
+     "http_status": 200,
+     "content_type": "text/html",
+     "cdn": "akamai",
+     "file_list_in_html": false
+    },
+    "page_scripts": {
+     "url": "https://www.edelweissmf.com/main.79fb35c62ee428a6.js",
+     "http_status": 200,
+     "content_type": "application/javascript"
+    },
+    "data_api": {
+     "url": "https://api.edelweissmf.com/edelweissmf/api/v1/mf/statutory-menus",
+     "query": "type=Statutory&fundType=MF",
+     "http_status": 403,
+     "content_type": "text/html",
+     "cdn": "akamai",
+     "response": "Access Denied"
+    },
+    "amfi_listed": {
+     "url": "https://www.edelweissmf.com/statutory#Portfolio-of-Schemes",
+     "same_destination_as": "statutory_page"
+    },
+    "result": "File list and October 2026 holdings not retrieved automatically"
+   }
+  },
+  "Invesco Mutual Fund": {
+   "key": "invesco-mutual-fund",
+   "aliases": [
+    "Invesco India"
+   ],
+   "website": "https://www.invescomutualfund.com",
+   "url": "https://www.invescomutualfund.com/literature-forms/monthly-holdings",
+   "parser": "manual_import",
+   "domains": [
+    "invescomutualfund.com"
+   ],
+   "formats": [
+    "xlsx"
+   ],
+   "verified_at": "2026-11-10",
+   "notes": "The AMFI-listed page redirects to /literature-forms/monthly-holdings/eq, which returns 404. The current page (from the site's sitemap) is a Sitefinity application with no file links in its HTML. No adapter for its content API yet."
+  }
+ }
+}

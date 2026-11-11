@@ -9,7 +9,8 @@ from io import BytesIO
 from threading import Lock
 from typing import Any, Callable
 import zipfile
-from urllib.parse import unquote, urljoin, urlsplit
+from time import perf_counter
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import pandas as pd
 import requests
@@ -20,6 +21,7 @@ from .adapters import (
     AMC_SOURCES,
     DISCLOSURE_NOT_PUBLISHED,
     DOWNLOAD_BLOCKED,
+    AMBIGUOUS_MAPPING,
     DOWNLOAD_FAILED,
     HOLDINGS_AVAILABLE,
     INVALID_WORKBOOK,
@@ -33,12 +35,16 @@ from .adapters import (
     classify_error,
     is_official_url,
     month_in_text as _month_in_text,
-    normalise_name as _normalise_name,
+    comparable_name as _normalise_name,
     official_domains,
     portfolio_date as _portfolio_date,
     source_for_amc,
 )
+from .adapters import AMFI_SOURCE_SUFFIX, NO_AUTOMATED_DISCOVERY, VIA_AMC_PAGE, VIA_AMFI_DIRECTORY, amfi_route, registry_sources
 from . import charlie_alpha
+from . import source_health
+from .listings import LISTING_READERS
+from .providers import SourceFailure
 from .portfolio_store import ASSET_DEBT, ASSET_EQUITY, ASSET_FOF, ASSET_FUND_UNIT, ASSET_HYBRID, ISIN_PATTERN, MAX_DEBT_WEIGHT, SOURCE_CHARLIE, SOURCE_IMPORT, discovery_due, file_scheme_name, load_snapshot, record_status, source_status, store_snapshot, stored_links
 from .providers import HEADERS, ProviderError, fetch_amfi_latest, fetch_url
 from .riskometer import read_scheme_riskometer
@@ -63,7 +69,9 @@ REASON_SOURCE_NOT_SUPPORTED = 'SOURCE_NOT_SUPPORTED'
 REASON_FILE_UNAVAILABLE = 'OFFICIAL_FILE_UNAVAILABLE'
 REASON_DOWNLOAD_BLOCKED = 'DOWNLOAD_BLOCKED'
 REASON_SCHEME_NOT_IN_FILES = 'SCHEME_NOT_IN_OFFICIAL_FILES'
+REASON_AMBIGUOUS_MAPPING = 'AMBIGUOUS_SCHEME_MAPPING'
 REASON_MESSAGES = {
+    REASON_AMBIGUOUS_MAPPING: 'More than one portfolio in the AMC file could be this scheme. It needs a developer review',
     REASON_SCHEME_NOT_IN_FILES: 'Scheme not found in the AMC published portfolio files',
     REASON_FILE_UNAVAILABLE: 'Official file unavailable',
     REASON_DOWNLOAD_BLOCKED: 'Download blocked by the AMC website',
@@ -320,12 +328,42 @@ def _sbi_monthly_links() -> list[dict[str, str]]:
     return links
 
 
-_EMBEDDED_EXCEL = re.compile(r'''["'(]((?:https?://|/)[^"'()\s<>]+?\.xlsx?)(?=["')\s?#])''', re.IGNORECASE)
+_EMBEDDED_EXCEL = re.compile(r'''["'(]((?:https?://|/)[^"'()\s<>]+?\.(?:xlsx?|zip))(?=["')\s?#])''', re.IGNORECASE)
 
 
 def _embedded_excel_paths(page_text: str) -> list[str]:
     """Excel file paths written inside a page's scripts or data rather than in links."""
     return list(dict.fromkeys(_EMBEDDED_EXCEL.findall(page_text.replace('\\/', '/'))))
+
+
+# The per-scheme status (as reported to the overlap response and status.json) for an AMC-level category.
+_STATUS_FOR_CATEGORY = {
+    source_health.ACCESS_BLOCKED: DOWNLOAD_BLOCKED,
+    source_health.RATE_LIMITED: DOWNLOAD_BLOCKED,
+    source_health.SOURCE_TEMPORARILY_UNAVAILABLE: DOWNLOAD_FAILED,
+    source_health.DOWNLOAD_FAILED: DOWNLOAD_FAILED,
+    source_health.SOURCE_URL_MOVED: SOURCE_NOT_SUPPORTED,
+    source_health.DISCOVERY_FAILED: SOURCE_NOT_SUPPORTED,
+}
+
+
+def _restricted_message(amc_key: str, source: dict[str, Any]) -> str:
+    """Why a restricted source is not asked, naming the route that refuses rather than the whole website."""
+    if source.get('restricted_route') == 'data_api':
+        return (f'403 Forbidden: the portfolio data API of {amc_key} refuses automated requests; its web page loads, '
+                'but the file list comes from that API. Use a staff upload or the authorised backup')
+    return f'403 Forbidden: automated access to {amc_key} is restricted; use a staff upload or the authorised backup'
+
+
+def _source_by_key(amc_key: str, page_url: str, parser_key: str) -> dict[str, Any]:
+    """The full source entry for an AMC key, with its AMFI name when known."""
+    primary_key = amc_key.removesuffix(AMFI_SOURCE_SUFFIX)
+    for name, entry in (*AMC_SOURCES.items(), *registry_sources().items()):
+        if entry.get('key') == primary_key:
+            if primary_key != amc_key:
+                return {'key': amc_key, 'url': page_url, 'parser': parser_key, 'domains': entry.get('domains'), 'amc': f'{name} (AMFI-listed page)'}
+            return {**entry, 'amc': name}
+    return {'key': amc_key, 'url': page_url, 'parser': parser_key}
 
 
 def _load_page_links(amc_key: str, page_url: str, parser_key: str) -> list[dict[str, str]]:
@@ -349,11 +387,44 @@ def _load_page_links(amc_key: str, page_url: str, parser_key: str) -> list[dict[
     except Exception:
         logger.exception('Portfolio page error cache read failed for %s', amc_key)
 
+    source = _source_by_key(amc_key, page_url, parser_key)
+    if parser_key in NO_AUTOMATED_DISCOVERY:
+        # Nothing is requested. The registry says why, with evidence.
+        restricted = source.get('access') == 'restricted'
+        category = source_health.ACCESS_BLOCKED if restricted else source_health.DISCOVERY_FAILED
+        known = source_health.read_health(amc_key)
+        if (known.get('last_failure') or {}).get('category') != category or not source_health._recent(known.get('last_checked_at'), minutes=360):
+            source_health.record_failure(amc_key, amc=source.get('amc', ''), source=source, stage=source_health.STAGE_LISTING, category=category, detail=source.get('notes') or 'No automated discovery for this source')
+        raise SourceFailure(
+            _restricted_message(amc_key, source) if restricted
+            else f'No monthly portfolio files found for {amc_key}: no automated discovery for this source yet',
+            category=category, stage=source_health.STAGE_LISTING, status=DOWNLOAD_BLOCKED if restricted else SOURCE_NOT_SUPPORTED,
+        )
+    blocked = source_health.circuit_open(amc_key, source)
+    if blocked:
+        # The AMC's source failed recently as a whole. Wait it out instead of asking again per fund.
+        stale = cache.get(f'{cache_key}:stale')
+        if stale:
+            return stale
+        failure = blocked.get('last_failure') or {}
+        category = failure.get('category') or source_health.SOURCE_TEMPORARILY_UNAVAILABLE
+        raise SourceFailure(f"Waiting before asking {amc_key} again ({category}): {failure.get('detail') or ''}".strip(), category=category, stage=source_health.STAGE_LISTING, status=_STATUS_FOR_CATEGORY.get(category, DOWNLOAD_FAILED))
+
+    resolved_url = ''
     try:
         if parser_key == 'sbi_monthly_excel':
             results = _sbi_monthly_links()
+        elif parser_key in LISTING_READERS:
+            results = []
+            adapter = adapter_for(source)
+            for link in LISTING_READERS[parser_key](source, PORTFOLIO_LOOKBACK_MONTHS):
+                if adapter.is_candidate(link['text'], link['url']) and is_official_url(link['url'], official_domains(amc_key)):
+                    results.append(link)
         else:
             response = fetch_url(page_url, timeout=(3, 15), attempts=1)
+            resolved_url = str(getattr(response, 'url', '') or '')
+            if source_health.looks_blocked(getattr(response, 'text', '') or ''):
+                raise SourceFailure(f'403 Forbidden: {amc_key} answered with an access-denied or challenge page', category=source_health.ACCESS_BLOCKED, stage=source_health.STAGE_LISTING, status=DOWNLOAD_BLOCKED)
             parser = _PortfolioLinks()
             parser.feed(response.text)
             results = []
@@ -373,8 +444,10 @@ def _load_page_links(amc_key: str, page_url: str, parser_key: str) -> list[dict[
                     seen_urls.add(href)
                     results.append({'url': href, 'text': text, 'month': month, 'portfolio_date': _portfolio_date(month)})
         if not results:
-            raise ProviderError(f'No monthly portfolio files found for {amc_key}')
+            raise SourceFailure(f'No monthly portfolio files found for {amc_key}', category=source_health.DISCOVERY_FAILED, stage=source_health.STAGE_LISTING)
     except ProviderError as exc:
+        category = getattr(exc, 'category', None) or source_health.category_for_exception(exc, stage=source_health.STAGE_LISTING)
+        source_health.record_failure(amc_key, amc=source.get('amc', ''), source=source, stage=source_health.STAGE_LISTING, category=category, detail=str(exc), evidence=getattr(exc, 'evidence', None))
         try:
             cache.set(f'{cache_key}:error', str(exc), timeout=PAGE_ERROR_CACHE_SECONDS)
             stale = cache.get(f'{cache_key}:stale')
@@ -384,6 +457,14 @@ def _load_page_links(amc_key: str, page_url: str, parser_key: str) -> list[dict[
         except Exception:
             logger.exception('Stale portfolio page cache read failed for %s', amc_key)
         raise
+    months = sorted({link['month'] for link in results})
+    if months and not set(months) & _recent_portfolio_months():
+        # The page answers but its newest file is older than the lookback: new months are published
+        # somewhere this page no longer shows. That is a discovery problem, not a working source.
+        source_health.record_failure(amc_key, amc=source.get('amc', ''), source=source, stage=source_health.STAGE_LISTING, category=source_health.DISCOVERY_FAILED, detail=f'The page lists no month in the lookback; its newest file is {months[-1]}', open_circuit=False)
+    else:
+        # Where the page ended up after redirects, so two links to one destination are fetched once.
+        source_health.record_success(amc_key, amc=source.get('amc', ''), source=source, stage=source_health.STAGE_LISTING, months=months, evidence={'final_url': source_health._safe_url(resolved_url)} if resolved_url else None)
     try:
         cache.set(cache_key, results, timeout=PAGE_CACHE_SECONDS)
         cache.set(f'{cache_key}:stale', results, timeout=PARSED_HOLDINGS_CACHE_SECONDS)
@@ -394,6 +475,7 @@ def _load_page_links(amc_key: str, page_url: str, parser_key: str) -> list[dict[
 
 
 def _monthly_files_for_fund(source: dict, fund_name: str) -> list[dict[str, str]]:
+    """Candidate files from one source's page (or, for HDFC, its published file pattern)."""
     adapter = adapter_for(source)
     try:
         links = _load_page_links(source['key'], source['url'], source['parser'])
@@ -402,6 +484,84 @@ def _monthly_files_for_fund(source: dict, fund_name: str) -> list[dict[str, str]
         logger.warning('Listing failed for %s; trying its published file pattern: %s', source['key'], exc)
         return links
     return adapter.select_links(links, fund_name)
+
+
+def _discover_files(source: dict, fund_name: str, *, amc_name: str, cached_months: set[str] | None = None, trail: dict[str, Any] | None = None, direct=None) -> list[dict[str, str]]:
+    """Official candidate files for this fund, AMFI-listed location first, then the AMC's own route.
+
+    Verified cached months are not asked for here: callers read them before anything else, and only
+    call this when a check is due. Within a month, files found through AMFI come before files found
+    directly; a URL found by both routes is listed (and so downloaded) once. Finding a link is not
+    success: each file is still downloaded from the AMC and validated before it is used.
+
+    direct is the direct-route lister (default _monthly_files_for_fund), so callers and tests can
+    supply their own. trail records what each route did, for the scheme's status and diagnostics.
+    """
+    direct = direct or _monthly_files_for_fund
+    trail = trail if trail is not None else {}
+    if cached_months:
+        trail['cache'] = {'verified_months': sorted(cached_months, reverse=True)}
+    if not settings.FUND_ANALYZER_AMFI_FALLBACK_ENABLED:
+        trail['amfi_discovery'] = {'result': 'skipped', 'reason': 'AMFI discovery is switched off'}
+        return _direct_route(direct, source, fund_name, trail)
+
+    route, reason = amfi_route(amc_name, source)
+    if route is None:
+        trail['amfi_discovery'] = {'result': 'skipped', 'reason': reason}
+        return _direct_route(direct, source, fund_name, trail)
+    page = source_health._safe_url(route['url'])
+    if route.get('same_as_direct'):
+        # AMFI lists exactly the page the AMC's own route reads: one request serves both.
+        try:
+            links = direct(source, fund_name)
+        except ProviderError as exc:
+            trail['amfi_discovery'] = {**_trail_error(exc), 'page': page, 'same_as_direct': True}
+            trail['direct_listing'] = {'result': 'not_repeated', 'reason': 'same page as the AMFI-listed location'}
+            raise
+        if links and all(link.get('guessed') for link in links):
+            # The page itself could not be read (HDFC answers 403); the AMC's published file-name
+            # pattern supplied these. They are the AMC route's, not AMFI's.
+            trail['amfi_discovery'] = {'result': 'error', 'detail': 'the AMFI-listed page could not be read', 'page': page, 'same_as_direct': True}
+            trail['direct_listing'] = {'result': 'ok', 'links': len(links), 'method': 'published file-name pattern'}
+            return links
+        trail['amfi_discovery'] = {'result': 'ok', 'links': len(links), 'page': page, 'same_as_direct': True}
+        trail['direct_listing'] = {'result': 'not_repeated', 'reason': 'same page as the AMFI-listed location'}
+        return [{**link, 'via': VIA_AMFI_DIRECTORY, 'discovery_page': page} for link in links]
+
+    amfi_links: list[dict[str, Any]] = []
+    try:
+        found = adapter_for(route).select_links(_load_page_links(route['key'], route['url'], route['parser']), fund_name)
+        amfi_links = [{**link, 'via': VIA_AMFI_DIRECTORY, 'source_key': route['key'], 'discovery_page': page} for link in found]
+        trail['amfi_discovery'] = {'result': 'ok', 'links': len(amfi_links), 'months': sorted({link['month'] for link in amfi_links}, reverse=True)[:6], 'page': page}
+    except ProviderError as exc:
+        trail['amfi_discovery'] = {**_trail_error(exc), 'page': page}
+    try:
+        direct_links = _direct_route(direct, source, fund_name, trail)
+    except ProviderError:
+        if amfi_links:
+            return amfi_links
+        raise
+    seen = {link['url'] for link in amfi_links}
+    return amfi_links + [link for link in direct_links if link['url'] not in seen]
+
+
+def _direct_route(direct, source: dict, fund_name: str, trail: dict[str, Any]) -> list[dict[str, str]]:
+    try:
+        links = direct(source, fund_name)
+    except ProviderError as exc:
+        trail['direct_listing'] = {**_trail_error(exc), 'page': source_health._safe_url(source.get('url') or '')}
+        raise
+    trail['direct_listing'] = {'result': 'ok', 'links': len(links), 'page': source_health._safe_url(source.get('url') or '')}
+    return links
+
+
+def _trail_error(exc: Exception) -> dict[str, Any]:
+    return {
+        'result': 'error',
+        'category': getattr(exc, 'category', None) or source_health.category_for_exception(exc, stage=source_health.STAGE_LISTING),
+        'detail': str(exc)[:200],
+        **({'http_status': exc.evidence.get('http_status')} if (getattr(exc, 'evidence', None) or {}).get('http_status') else {}),
+    }
 
 
 def _check_workbook_payload(payload: bytes) -> None:
@@ -419,13 +579,21 @@ def _check_workbook_payload(payload: bytes) -> None:
         raise PortfolioError(INVALID_WORKBOOK, 'Monthly portfolio workbook is too large to read')
 
 
-def _download_portfolio_file(amc_key: str, url: str) -> bytes:
-    """Download a file found by an adapter, staying on the AMC's domain and within size limits."""
+def _download_portfolio_file(amc_key: str, url: str, *, guessed: bool = False) -> bytes:
+    """Download a file found by an adapter, staying on the AMC's domain and within size limits.
+
+    An HTTP 200 is not a success until the bytes are a real workbook or archive. Every failure is
+    recorded against the AMC with its evidence; one that concerns the whole source opens its circuit.
+    """
     domains = official_domains(amc_key)
     if not is_official_url(url, domains):
         raise PortfolioError(SOURCE_NOT_SUPPORTED, f'File is not on an official domain of {amc_key}')
+    started = perf_counter()
+    evidence: dict[str, Any] = {}
     try:
+        source_health.throttle(urlsplit(url).hostname or '')
         with requests.get(url, headers=HEADERS, timeout=(3, 30), stream=True) as response:
+            evidence = source_health.evidence_from_response(response, url, started)
             if not is_official_url(response.url, domains):
                 raise PortfolioError(DOWNLOAD_BLOCKED, f'File redirected away from an official domain of {amc_key}')
             response.raise_for_status()
@@ -436,11 +604,26 @@ def _download_portfolio_file(amc_key: str, url: str) -> bytes:
                     raise PortfolioError(INVALID_WORKBOOK, 'Monthly portfolio file is larger than the allowed size')
                 chunks.append(chunk)
     except requests.RequestException as exc:
-        raise ProviderError(str(exc)) from exc
+        failed = getattr(exc, 'response', None)
+        if failed is not None:
+            evidence = source_health.evidence_from_response(failed, url, started)
+        elif not evidence:
+            evidence = {'url': url.split('?')[0], 'error': exc.__class__.__name__}
+        category =source_health.category_for_http(evidence.get('http_status'), stage=source_health.STAGE_DOWNLOAD, guessed=guessed) if evidence.get('http_status') else source_health.category_for_exception(exc, stage=source_health.STAGE_DOWNLOAD)
+        if category == source_health.ACCESS_BLOCKED or (category in source_health.AMC_WIDE_CATEGORIES and not guessed):
+            source_health.record_failure(amc_key, stage=source_health.STAGE_DOWNLOAD, category=category, detail=str(exc), evidence=evidence)
+        raise SourceFailure(str(exc), category=category, stage=source_health.STAGE_DOWNLOAD, evidence=evidence) from exc
     payload = b''.join(chunks)
     if not payload:
         raise ProviderError(f'Empty monthly portfolio file from {amc_key}')
-    _check_workbook_payload(payload)
+    try:
+        _check_workbook_payload(payload)
+    except PortfolioError as exc:
+        # A sign-in or error page served with HTTP 200 instead of the file.
+        blocked = source_health.looks_blocked(payload[:20000].decode('utf-8', 'ignore'))
+        source_health.record_failure(amc_key, stage=source_health.STAGE_DOWNLOAD, category=source_health.ACCESS_BLOCKED if blocked else source_health.INVALID_WORKBOOK, detail=str(exc), evidence=evidence)
+        raise
+    source_health.record_success(amc_key, stage=source_health.STAGE_DOWNLOAD, evidence={key: evidence.get(key) for key in ('http_status', 'content_type', 'seconds', 'cdn')})
     return payload
 
 
@@ -449,7 +632,7 @@ def _cached_file(key: tuple[str, str], url: str) -> bytes | None:
     return entry[1][url] if entry and entry[0] > datetime.now() and url in entry[1] else None
 
 
-def _download_cached(amc_key: str, month: str, url: str) -> bytes:
+def _download_cached(amc_key: str, month: str, url: str, *, guessed: bool = False) -> bytes:
     """One download per file, however many requests ask at once.
 
     Each file has its own lock, so a second request for the same file waits for the first and
@@ -466,7 +649,7 @@ def _download_cached(amc_key: str, month: str, url: str) -> bytes:
             hit = _cached_file(key, url)
             if hit is not None:
                 return hit
-        payload = _download_portfolio_file(amc_key, url)
+        payload = _download_portfolio_file(amc_key, url, **({'guessed': True} if guessed else {}))
         with _download_lock:
             now = datetime.now()
             entry = _portfolio_file_cache.get(key)
@@ -483,6 +666,15 @@ def _download_cached(amc_key: str, month: str, url: str) -> bytes:
         return payload
 
 
+def _scheme_title(frame: pd.DataFrame) -> str:
+    """The name a sheet gives its own scheme, from a 'Scheme Name :' row, normalised. '' when there is none."""
+    for row_index in range(min(len(frame), 8)):
+        cells = [str(value).strip() for value in frame.iloc[row_index].tolist() if not pd.isna(value) and str(value).strip()]
+        if len(cells) > 1 and re.sub(r'[^a-z]+', ' ', cells[0].lower()).strip() in ('scheme name', 'name of the scheme', 'name of scheme'):
+            return _normalise_name(cells[1])
+    return ''
+
+
 def _sheet_name_score(sheet_name: str, frame: pd.DataFrame, fund_name: str) -> int:
     has_holdings_header = any(
         'isin' in ' '.join(str(value).lower() for value in frame.iloc[row_index].tolist())
@@ -492,10 +684,13 @@ def _sheet_name_score(sheet_name: str, frame: pd.DataFrame, fund_name: str) -> i
         return 0
     wanted = _normalise_name(fund_name)
     sheet_title = _normalise_name(sheet_name)
+    title = _normalise_name(' '.join(frame.iloc[:3, :12].fillna('').astype(str).to_numpy().ravel()))
+    # The scheme's own title written out in full is the strongest evidence, ahead of a longer name that merely contains it.
+    if wanted and wanted in (sheet_title, _scheme_title(frame)):
+        return 3.5
     if wanted and wanted in sheet_title:
         return 3
     # A sheet's title beats a mention lower down, such as one fund holding units of another.
-    title = _normalise_name(' '.join(frame.iloc[:3, :12].fillna('').astype(str).to_numpy().ravel()))
     if wanted and wanted in title:
         return 2.5
     context = frame.iloc[:25, :12].fillna('').astype(str).to_numpy().ravel()
@@ -670,7 +865,15 @@ def _locate_holdings_table(
     if not ranked or ranked[0][0] == 0:
         # A file name proves nothing. The workbook itself must name this scheme.
         raise ProviderError(f'No sheet matched fund {fund_name}')
-    _, sheet_name, frame = ranked[0]
+    top_score, sheet_name, frame = ranked[0]
+    # Two different schemes tied at title level: choosing one would be a guess, so the mapping is refused.
+    tied = [(name, _scheme_title(f) or _normalise_name(name)) for score, name, f in ranked if score == top_score]
+    if top_score >= 2.5 and len({title for _, title in tied}) > 1:
+        names = [name for name, _ in tied][:6]
+        if diagnostics is not None:
+            diagnostics['ambiguous_candidates'] = names
+        logger.warning('Ambiguous scheme mapping for %s. Candidate sheets: %s', fund_name, names)
+        raise ProviderError(f'Ambiguous scheme mapping for {fund_name}: candidates {names}')
     if diagnostics is not None:
         diagnostics['matched_sheet_name'] = sheet_name
         diagnostics['reporting_date'] = _reporting_date_from_frame(frame)
@@ -776,6 +979,7 @@ def _read_equity_holdings(
             equity_context = section
 
     holdings: dict[str, float] = {}
+    duplicate_rows = 0  # the same ISIN on more than one row (split lots); weights are added
     names: dict[str, str] = {}
     industries: dict[str, str] = {}
     name_at, industry_at = _name_and_industry_columns(frame, header_at, asset_at)
@@ -802,6 +1006,7 @@ def _read_equity_holdings(
         weight = _row_weight(table, row, row_index)
         if not ISIN_PATTERN.match(isin) or weight is None:
             continue
+        duplicate_rows += isin in holdings
         holdings[isin] = holdings.get(isin, 0.0) + weight
         if name_at is not None and name_at < len(row):
             names.setdefault(isin, _clean_holding_name(row[name_at]))
@@ -816,6 +1021,8 @@ def _read_equity_holdings(
     if diagnostics is not None:
         diagnostics['holding_names'] = names
         diagnostics['holding_industries'] = industries
+    if diagnostics is not None and duplicate_rows:
+        diagnostics['duplicate_isin_rows'] = duplicate_rows
     _add_file_details(diagnostics, payload, table, fund_name, holdings)
     return holdings
 
@@ -955,6 +1162,7 @@ def _read_debt_holdings(
     rating_at = _column_index(headers, ('rating', 'industry'))
 
     holdings: dict[str, float] = {}
+    duplicate_rows = 0  # the same ISIN on more than one row (split lots); weights are added
     names: dict[str, str] = {}
     ratings: dict[str, str] = {}
     instrument_types: dict[str, str] = {}
@@ -1013,6 +1221,7 @@ def _read_debt_holdings(
             # A repo row's "ISIN" is the AMC's own deal code, such as TREP01102026.
             add_other(None if other_type == REPO else isin, name or isin, weight, other_type)
             continue
+        duplicate_rows += isin in holdings
         holdings[isin] = holdings.get(isin, 0.0) + weight
         # Not the name cleaner: its footnote removal would turn AA+ into AA.
         rating = re.sub(r'\s+', ' ', str(row[rating_at])).strip() if rating_at is not None and rating_at < len(row) and not pd.isna(row[rating_at]) else ''
@@ -1043,6 +1252,8 @@ def _read_debt_holdings(
         diagnostics['instrument_types'] = instrument_types
         diagnostics['issuers'] = issuers
         diagnostics['other_holdings'] = other_rows
+    if diagnostics is not None and duplicate_rows:
+        diagnostics['duplicate_isin_rows'] = duplicate_rows
     _add_file_details(diagnostics, payload, table, fund_name, holdings)
     return holdings
 
@@ -1068,6 +1279,7 @@ def _read_fund_unit_holdings(
     name_at, _ = _name_and_industry_columns(frame, table['header_at'], asset_at)
 
     holdings: dict[str, float] = {}
+    duplicate_rows = 0  # the same ISIN on more than one row (split lots); weights are added
     names: dict[str, str] = {}
     instrument_types: dict[str, str] = {}
     others: dict[str, dict[str, Any]] = {}
@@ -1117,6 +1329,7 @@ def _read_fund_unit_holdings(
             market_value = _market_value(table, row)
             if table['weight_at'] is not None and market_value is not None:
                 stated.append((weight, market_value))
+            duplicate_rows += isin in holdings
             holdings[isin] = holdings.get(isin, 0.0) + weight
             names.setdefault(isin, name or isin)
             instrument_types[isin] = MUTUAL_FUND_UNITS
@@ -1145,6 +1358,8 @@ def _read_fund_unit_holdings(
         diagnostics['security_classes'] = {isin: ASSET_FUND_UNIT for isin in holdings}
         diagnostics['classes_read'] = [ASSET_FUND_UNIT]
         diagnostics['unclassified_weight'] = sum(row['weight'] for row in other_rows if row['instrument_type'] == 'Other')
+    if diagnostics is not None and duplicate_rows:
+        diagnostics['duplicate_isin_rows'] = duplicate_rows
     _add_file_details(diagnostics, payload, table, fund_name, holdings)
     return holdings
 
@@ -1176,6 +1391,7 @@ def _read_portfolio(asset_class: str, payload: bytes, url: str, fund_name: str, 
         part: dict[str, Any] = {'_skip_file_details': True} if holdings else {}
         try:
             rows = readers[security_class](payload, url, fund_name, parser_key, part, workbook)
+            details['duplicate_isin_rows'] = details.get('duplicate_isin_rows', 0) + part.pop('duplicate_isin_rows', 0)
         except _NoHoldingsFound:
             if index == 0 and asset_class != ASSET_HYBRID:
                 raise
@@ -1581,13 +1797,17 @@ def _holdings_from_link(
         }
     else:
         if link['url'] not in downloaded:
-            downloaded[link['url']] = _download_cached(source['key'], month, link['url'])
-        if link['url'] not in workbooks:
-            workbooks[link['url']] = _workbook_sheets(downloaded[link['url']], urlsplit(link['url']).path.lower())
-        holdings = _read_holdings(record)(
-            downloaded[link['url']], link['url'], scheme_name, source['parser'],
-            debug, workbooks[link['url']],
-        )
+            downloaded[link['url']] = _download_cached(link.get('source_key') or source['key'], month, link['url'], **({'guessed': True} if link.get('guessed') else {}))
+        members = _archive_members(downloaded[link['url']])
+        if members is None:
+            if link['url'] not in workbooks:
+                workbooks[link['url']] = _workbook_sheets(downloaded[link['url']], urlsplit(link['url']).path.lower())
+            holdings = _read_holdings(record)(
+                downloaded[link['url']], link['url'], scheme_name, source['parser'],
+                debug, workbooks[link['url']],
+            )
+        else:
+            holdings = _holdings_from_archive(link['url'], members, scheme_name, source, debug, downloaded, workbooks, record)
         # These belong with the holdings, not in the debug response.
         names = debug.pop('holding_names', {})
         industries = debug.pop('holding_industries', {})
@@ -1599,6 +1819,7 @@ def _holdings_from_link(
         security_classes = debug.pop('security_classes', {})
         classes_read = debug.pop('classes_read', default_classes)
         unclassified_weight = debug.pop('unclassified_weight', None)
+        duplicate_isin_rows = debug.pop('duplicate_isin_rows', 0)
         reporting_date = debug.get('reporting_date')
     if not reporting_date:
         raise ProviderError('Portfolio reporting date was not found inside the disclosure file')
@@ -1624,12 +1845,124 @@ def _holdings_from_link(
         'unclassified_weight': unclassified_weight,
         'source_url': source_url,
         'source_type': stored_source,
+        # Where the file was found. A stored month keeps what it recorded when it was verified.
+        'discovered_via': (stored.get('discovered_via') if link.get('stored') else link.get('via')) or VIA_AMC_PAGE,
     }
+    if not link.get('stored') and not link.get('imported') and not link.get('cached'):
+        result['duplicate_isin_rows'] = duplicate_isin_rows
     if not link.get('imported') and not link.get('cached') and not link.get('stored'):
         _cache_parsed_holdings(code, reporting_date, holdings, link['url'], names, industries, benchmark, risk_level, instrument_types, issuers, other_holdings, {'security_classes': security_classes, 'classes_read': classes_read, 'unclassified_weight': unclassified_weight})
         if record:
-            store_snapshot(record, code, month, result, source_url=link['url'], payload=downloaded.get(link['url']))
+            store_snapshot(record, code, month, result, source_url=link['url'], payload=downloaded.get(link['url']), discovery=_discovery_of(link, source))
     return result
+
+
+# An archive with more workbooks than this holds one per scheme, so only a workbook named for the
+# scheme may be read. A smaller one holds combined workbooks (equity, debt), and each is searched.
+MAX_SHARED_ARCHIVE_MEMBERS = 6
+_WORKBOOK_MEMBER = re.compile(r'(?i)\.(xlsx|xlsm|xls|csv)$')
+
+
+def _archive_members(payload: bytes) -> list[str] | None:
+    """The workbooks inside a ZIP of workbooks, or None for anything else (an .xlsx is a ZIP too)."""
+    if payload[:4] != b'PK\x03\x04':
+        return None
+    try:
+        with zipfile.ZipFile(BytesIO(payload)) as archive:
+            names = archive.namelist()
+    except zipfile.BadZipFile:
+        return None
+    if '[Content_Types].xml' in names:
+        return None
+    members = [name for name in names if _WORKBOOK_MEMBER.search(name) and not name.startswith('__MACOSX') and not name.rsplit('/', 1)[-1].startswith(('~$', '.'))]
+    if not members:
+        raise PortfolioError(INVALID_WORKBOOK, 'Monthly portfolio archive contains no workbooks')
+    return members
+
+
+def _archive_members_for_scheme(members: list[str], scheme_name: str) -> list[str]:
+    """Strictly the workbook named for this scheme, or every combined workbook. Never a near miss."""
+    wanted = _normalise_name(scheme_name)
+    named = [name for name in members if _normalise_name(re.sub(_WORKBOOK_MEMBER, '', name.rsplit('/', 1)[-1])) == wanted]
+    if len(named) > 1:
+        raise PortfolioError(AMBIGUOUS_MAPPING, f'Ambiguous scheme mapping: {len(named)} workbooks in the archive are named for {scheme_name}')
+    if named:
+        return named
+    if len(members) > MAX_SHARED_ARCHIVE_MEMBERS:
+        raise PortfolioError(SCHEME_NOT_FOUND, f'No sheet matched {scheme_name}: no workbook in the per-scheme archive is named for it')
+    return members
+
+
+def _holdings_from_archive(url: str, members: list[str], scheme_name: str, source: dict[str, Any], debug: dict[str, Any], downloaded: dict[str, bytes], workbooks: dict[str, Any], record: dict[str, Any] | None) -> dict[str, float]:
+    """Read the scheme from the right workbook of a monthly ZIP. More than one match is refused."""
+    chosen = _archive_members_for_scheme(members, scheme_name)
+    found: list[tuple[str, dict[str, float], dict[str, Any]]] = []
+    errors: list[str] = []
+    with zipfile.ZipFile(BytesIO(downloaded[url])) as archive:
+        for member in chosen:
+            key = f"{url.rstrip('/')}/{quote(member.rsplit('/', 1)[-1])}"
+            try:
+                if key not in downloaded:
+                    if archive.getinfo(member).file_size > MAX_PORTFOLIO_FILE_BYTES:
+                        raise PortfolioError(INVALID_WORKBOOK, f'{member} is larger than the allowed size')
+                    downloaded[key] = archive.read(member)
+                if key not in workbooks:
+                    workbooks[key] = _workbook_sheets(downloaded[key], member.lower())
+                attempt = dict(debug)
+                rows = _read_holdings(record)(downloaded[key], key, scheme_name, source['parser'], attempt, workbooks[key])
+            except _NoHoldingsFound as exc:
+                errors.append(f'{member}: {exc}')
+                continue
+            except ProviderError as exc:
+                if getattr(exc, 'status', None) == AMBIGUOUS_MAPPING or 'ambiguous' in str(exc).lower():
+                    raise
+                errors.append(f'{member}: {exc}')
+                continue
+            found.append((member, rows, attempt))
+    if len(found) > 1:
+        raise PortfolioError(AMBIGUOUS_MAPPING, f"Ambiguous scheme mapping: {', '.join(member for member, _, _ in found)} each hold {scheme_name}")
+    if not found:
+        if len(chosen) == 1 and errors:
+            raise ProviderError(errors[0].split(': ', 1)[1])
+        raise PortfolioError(SCHEME_NOT_FOUND, f'No sheet matched {scheme_name} in the archive: ' + '; '.join(errors)[:500])
+    member, rows, attempt = found[0]
+    debug.clear()
+    debug.update(attempt)
+    debug['archive_member'] = member
+    return rows
+
+
+def _discovery_of(link: dict[str, Any], source: dict[str, Any]) -> dict[str, str]:
+    """Where a file was found (the AMC's page or AMFI's directory) and which host it was downloaded from."""
+    return {
+        'discovered_via': link.get('via') or VIA_AMC_PAGE,
+        'discovery_page': link.get('discovery_page') or source_health._safe_url(source.get('url') or ''),
+        'download_host': (urlsplit(link['url']).hostname or '').lower(),
+    }
+
+
+def _attempt_entry(month: str, link: dict[str, Any], result: str, error: Exception | None = None) -> dict[str, Any]:
+    """One try at one month's file, for the scheme's source trail."""
+    route = 'charlie_alpha' if link.get('charlie') else 'stored' if link.get('stored') else 'upload' if link.get('imported') or link.get('cached') else link.get('via') or VIA_AMC_PAGE
+    entry = {'month': month, 'route': route, 'result': result}
+    if str(link.get('url', '')).startswith('http'):
+        entry['host'] = (urlsplit(link['url']).hostname or '').lower()
+    if error is not None:
+        entry.update({'category': getattr(error, 'category', None) or getattr(error, 'code', None) or classify_error(error), 'detail': (str(error) or error.__class__.__name__)[:160]})
+    return entry
+
+
+def _source_trail(debug: dict[str, Any], backup_attempted: bool) -> dict[str, Any]:
+    """Per scheme: what each route did, which source was finally used, and why not if none."""
+    discovery = debug.get('discovery') or {}
+    return {
+        'direct_listing': discovery.get('direct_listing') or {'result': 'not_needed'},
+        'amfi_discovery': discovery.get('amfi_discovery') or {'result': 'not_needed'},
+        'attempts': (debug.get('source_attempts') or [])[-12:],
+        'backup': {'enabled': charlie_alpha.enabled(), 'attempted': backup_attempted, **({'error': debug['backup_error']} if debug.get('backup_error') else {})},
+        'selected': debug.get('selected'),
+        'failure': None if debug.get('selected') else (debug.get('error') or None),
+    }
 
 
 def _link_error_status(link: dict[str, Any], error: Exception) -> str:
@@ -1722,7 +2055,7 @@ def fetch_fund_holdings(code: str, record: dict[str, Any] | None) -> dict[str, A
     name = file_scheme_name(record)
     if source and discovery_due(record):
         try:
-            links += _monthly_files_for_fund(source, name)
+            links += _discover_files(source, name, amc_name=amc_name, cached_months={link['month'] for link in stored if not link.get('third_party')})
         except ProviderError as exc:
             logger.warning('Portfolio link lookup failed for AMC %s: %s', amc_name, exc)
     recent_months = _recent_portfolio_months()
@@ -1785,6 +2118,7 @@ def fetch_fund_holdings(code: str, record: dict[str, Any] | None) -> dict[str, A
             'holdings': sorted([*rows, *_debt_other_rows(others)], key=lambda row: -row['weight']),
             'holdings_as_of': result['portfolio_date'],
             'holdings_source': result.get('source_type') or charlie_alpha.SOURCE_OFFICIAL,
+            'holdings_source_label': charlie_alpha.source_label(result.get('source_type')),
             'benchmark': result.get('benchmark'),
             'asset_class': asset_class,
             'allocation': allocation,
@@ -1841,6 +2175,8 @@ def _fund_reason_code(fund: dict[str, Any]) -> str | None:
         return REASON_DOWNLOAD_BLOCKED
     if status == SCHEME_NOT_FOUND:
         return REASON_SCHEME_NOT_IN_FILES
+    if status == AMBIGUOUS_MAPPING:
+        return REASON_AMBIGUOUS_MAPPING
     if status in (DISCLOSURE_NOT_PUBLISHED, DOWNLOAD_FAILED):
         return REASON_FILE_UNAVAILABLE
     return REASON_HOLDINGS_UNAVAILABLE
@@ -1911,6 +2247,8 @@ def analyze_holdings_overlap(scheme_codes: list[str], portfolio_month: str | Non
     name_by_code: dict[str, str] = {}
     checked_sources: set[str] = set()
     status_by_code: dict[str, str] = {}
+    # Funds whose AMC listing was skipped because it was checked recently: code -> (source, AMC, cached months).
+    listing_skipped: dict[str, tuple[dict[str, Any], str, set[str]]] = {}
     # The backup source is tried per fund, and only once the official path has failed for it.
     backup_tried: set[str] = set()
     backup_failed: dict[str, str] = {}
@@ -1989,16 +2327,24 @@ def analyze_holdings_overlap(scheme_codes: list[str], portfolio_month: str | Non
             # Ask the AMC's site only when no recent check has already answered this.
             if can_discover and discovery_due(record):
                 checked_sources.add(code)
-                remote_links = _monthly_files_for_fund(source, name_by_code[code])
+                verified = {link['month'] for link in stored if not link.get('third_party')}
+                remote_links = _discover_files(source, name_by_code[code], amc_name=amc_name, cached_months=verified, trail=debug.setdefault('discovery', {}))
                 listing_errors = [link['listing_error'] for link in remote_links if link.get('listing_error')]
                 if listing_errors:
                     debug['error'] = listing_errors[0]
             elif can_discover and not stored:
                 status_by_code[code] = source_status(record) or DOWNLOAD_FAILED
                 debug['error'] = 'Waiting before asking this source again'
+            elif can_discover:
+                # Checked recently, so only its cached months are known. Listed below if the backup is needed.
+                listing_skipped[code] = (source, amc_name, {link['month'] for link in stored if not link.get('third_party')})
         except ProviderError as exc:
             logger.warning('Portfolio link lookup failed for AMC %s: %s', amc_name, exc)
             debug['error'] = str(exc)
+            if getattr(exc, 'category', None):
+                debug['source_category'] = exc.category
+            if getattr(exc, 'status', None):
+                status_by_code.setdefault(code, exc.status)
         try:
             links = [link for link in [*stored, *imported_links, *parsed_links, *remote_links] if link.get('month') in recent_months]
             # Within a month, official files come before a saved third-party copy of that month.
@@ -2015,9 +2361,25 @@ def analyze_holdings_overlap(scheme_codes: list[str], portfolio_month: str | Non
         except ProviderError as exc:
             debug['error'] = debug['error'] or str(exc)
             # A directory page that lists nothing usable is a source we can't read yet.
-            if source and source.get('parser') == 'directory_monthly_excel' and classify_error(debug['error']) == DISCLOSURE_NOT_PUBLISHED:
+            if source and source.get('parser') in ('directory_monthly_excel', *LISTING_READERS) and classify_error(debug['error']) == DISCLOSURE_NOT_PUBLISHED:
                 status_by_code.setdefault(code, SOURCE_NOT_SUPPORTED)
             fund_results.append({'scheme_code': code, 'scheme_name': record.get('scheme_name'), 'amc': amc_name, 'available': False, 'reason': 'Overlap unavailable right now'})
+
+    # A fund that only the backup can supply may share no cached month with the others, which then need
+    # an older official month than they have stored. Their listings were skipped as recently checked;
+    # list them now, so the backup is used only for the fund and month that is really missing, never in
+    # place of an official file that exists. Listings are cached per AMC and the AMC's pause still applies.
+    if charlie_alpha.enabled() and any(links and all(link.get('charlie') or link.get('third_party') for link in links) for links in links_by_code.values()):
+        for code, (source, amc_name, verified) in listing_skipped.items():
+            if code not in links_by_code:
+                continue
+            try:
+                found = _discover_files(source, name_by_code[code], amc_name=amc_name, cached_months=verified, trail=debug_by_code[code].setdefault('discovery', {}))
+            except ProviderError as exc:
+                logger.info('Official listing for %s unavailable while checking older months: %s', code, exc)
+                continue
+            known = {link['url'] for link in links_by_code[code]}
+            links_by_code[code] = [*links_by_code[code], *(link for link in found if link.get('month') in recent_months and link['url'] not in known)]
 
     report('validating')
     valid_by_month: dict[str, dict[str, dict[str, Any]]] = {}
@@ -2051,9 +2413,11 @@ def analyze_holdings_overlap(scheme_codes: list[str], portfolio_month: str | Non
         for link in candidates:
             try:
                 loaded[key] = _holdings_from_link(code, month, link, source_by_code[code], name_by_code[code], debug, downloaded, workbooks, record_by_code[code])
+                debug.setdefault('source_attempts', []).append(_attempt_entry(month, link, 'ok'))
                 return loaded[key]
             except Exception as exc:
                 failed_links.add((code, link['url']))
+                debug.setdefault('source_attempts', []).append(_attempt_entry(month, link, 'error', exc))
                 if link.get('charlie'):
                     # A backup failure never overwrites the official reader's own reason.
                     backup_failed[code] = getattr(exc, 'code', 'ERROR')
@@ -2204,11 +2568,19 @@ def analyze_holdings_overlap(scheme_codes: list[str], portfolio_month: str | Non
                 'available': True, 'reason': None, 'portfolio_month': best_month,
                 'portfolio_date': selected['portfolio_date'],
                 'holdings_source': selected.get('source_type') or charlie_alpha.SOURCE_OFFICIAL,
+                'holdings_source_label': charlie_alpha.source_label(selected.get('source_type')),
                 'holding_count': len(_weights_of(selected, FUND_SECURITY_CLASSES[_asset_class(record_by_code[code])])),
                 'asset_class': _asset_class(record_by_code[code]),
                 **({'unclassified_pct': round(selected['unclassified_weight'], 2)} if (selected.get('unclassified_weight') or 0) > MATERIAL_UNCLASSIFIED_WEIGHT else {}),
             })
             debug_by_code[code]['chosen_common_month'] = best_month
+            debug_by_code[code]['selected'] = {
+                'source': selected.get('source_type') or charlie_alpha.SOURCE_OFFICIAL,
+                'source_label': charlie_alpha.source_label(selected.get('source_type')),
+                'discovered_via': selected.get('discovered_via') or VIA_AMC_PAGE,
+                'disclosure_date': selected.get('portfolio_date'),
+                'download_url': source_health._safe_url(selected.get('source_url') or ''),
+            }
             debug_by_code[code]['reporting_date'] = selected['portfolio_date']
             debug_by_code[code]['matched_sheet_name'] = selected['matched_sheet_name']
             debug_by_code[code]['parse_result'] = {
@@ -2233,7 +2605,7 @@ def analyze_holdings_overlap(scheme_codes: list[str], portfolio_month: str | Non
         # No common month says nothing about the source: its file wasn't even opened,
         # so it must not make the next request wait a day before trying it.
         if code in checked_sources and status != NO_COMMON_MONTH:
-            record_status(record_by_code[code], status, debug_by_code[code]['error'] or '', fund.get('portfolio_month'))
+            record_status(record_by_code[code], status, debug_by_code[code]['error'] or '', fund.get('portfolio_month'), trail=_source_trail(debug_by_code[code], code in backup_tried))
         if code in record_by_code:
             state = scheme_status(record_by_code[code])
             fund.update({'scheme_status': state['status'], 'last_nav_date': state['last_nav_date']})
@@ -2299,6 +2671,7 @@ def analyze_holdings_overlap(scheme_codes: list[str], portfolio_month: str | Non
                 'left_source': left_data.get('source_type') or charlie_alpha.SOURCE_OFFICIAL,
                 'right_source': right_data.get('source_type') or charlie_alpha.SOURCE_OFFICIAL,
                 'holdings_source': _pair_source(left_data, right_data),
+                'holdings_source_label': charlie_alpha.source_label(_pair_source(left_data, right_data)),
                 # COMMON_TO_ALL: the one month every comparable fund reported. PAIRWISE: no such month
                 # exists, so this pair uses the latest month its own two funds share.
                 'month_basis': 'COMMON_TO_ALL' if global_month and pair_month == global_month else 'PAIRWISE',

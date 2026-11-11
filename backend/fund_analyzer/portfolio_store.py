@@ -26,6 +26,7 @@ from typing import Any
 from django.conf import settings
 
 from .adapters import (
+    AMBIGUOUS_MAPPING,
     AMC_SOURCES,
     DISCLOSURE_NOT_PUBLISHED,
     DOWNLOAD_BLOCKED,
@@ -72,12 +73,18 @@ RETRY_DELAYS = {
     DOWNLOAD_BLOCKED: timedelta(hours=24),
     SOURCE_NOT_SUPPORTED: timedelta(days=7),
     SCHEME_NOT_FOUND: timedelta(days=1),
+    AMBIGUOUS_MAPPING: timedelta(days=1),
     INVALID_WORKBOOK: timedelta(days=1),
     PARSING_FAILED: timedelta(days=1),
     DISCLOSURE_NOT_PUBLISHED: timedelta(hours=6),
 }
 MAX_RETRY_DELAY = timedelta(hours=24)
 NEEDS_ADMIN = (SOURCE_NOT_SUPPORTED, DOWNLOAD_BLOCKED, INVALID_WORKBOOK, SCHEME_NOT_FOUND, PARSING_FAILED)
+# Raise this whenever scheme/sheet matching improves. A failure recorded by an older matcher is retried at once,
+# once, instead of waiting out its back-off. Funds that are available, and other cache files, are untouched.
+# 3: monthly ZIP archives are read, so failures recorded before that are retried once.
+MATCHER_VERSION = 3
+RETRY_WITH_NEW_MATCHER = (SOURCE_NOT_SUPPORTED, INVALID_WORKBOOK, SCHEME_NOT_FOUND, PARSING_FAILED, AMBIGUOUS_MAPPING)
 
 
 def _slug(value: str) -> str:
@@ -237,7 +244,7 @@ def read_snapshot(record: dict[str, Any], month: str) -> dict[str, Any] | None:
     return dict(payload) if checks[month] else None
 
 
-def store_snapshot(record: dict[str, Any], code: str, month: str, result: dict[str, Any], *, source_url: str = '', payload: bytes | None = None, source_type: str = SOURCE_DOWNLOAD, validation: dict[str, Any] | None = None) -> None:
+def store_snapshot(record: dict[str, Any], code: str, month: str, result: dict[str, Any], *, source_url: str = '', payload: bytes | None = None, source_type: str = SOURCE_DOWNLOAD, validation: dict[str, Any] | None = None, discovery: dict[str, str] | None = None) -> None:
     """Save a verified month. A failure here must never stop the holdings being used."""
     file_hash = hashlib.sha256(payload).hexdigest() if payload else ''
     try:
@@ -252,7 +259,10 @@ def store_snapshot(record: dict[str, Any], code: str, month: str, result: dict[s
                 keep_upload = existing.get('source_type') == SOURCE_IMPORT and source_type == SOURCE_DOWNLOAD
                 # Third-party data never replaces official data for the same month. Official data replaces it.
                 keep_official = source_type == SOURCE_CHARLIE and existing.get('source_type') != SOURCE_CHARLIE
-                if unchanged or keep_upload or keep_official:
+                # A month already verified through one official route is not replaced by a different
+                # file found through another route (AMFI-listed page vs the AMC's own route).
+                keep_verified = bool(discovery) and existing.get('source_type') == SOURCE_DOWNLOAD and existing.get('discovered_via', 'amc_page') != discovery.get('discovered_via')
+                if unchanged or keep_upload or keep_official or keep_verified:
                     if codes != existing.get('scheme_codes'):
                         _write_json_atomic(path, {**existing, 'scheme_codes': codes})
                     return
@@ -271,8 +281,10 @@ def store_snapshot(record: dict[str, Any], code: str, month: str, result: dict[s
                 'source_type': source_type,
                 'source_url': (source_url or '')[:1000],
                 'file_hash': file_hash,
+                **({key: str(value)[:500] for key, value in discovery.items() if value} if discovery else {}),
+                **({'duplicate_isin_rows': int(result['duplicate_isin_rows'])} if result.get('duplicate_isin_rows') else {}),
                 'validation_status': VERIFIED,
-                **({'third_party': True, 'validation': validation or {}} if source_type == SOURCE_CHARLIE else {}),
+                **({'third_party': True, 'source_label': 'Third-party API — Charlie Alpha', 'validation': validation or {}} if source_type == SOURCE_CHARLIE else {}),
                 'benchmark': result.get('benchmark') or '',
                 'risk_level': result.get('risk_level') or '',
                 **({'other_holdings': result['other_holdings']} if result.get('other_holdings') else {}),
@@ -339,6 +351,7 @@ def load_snapshot(snapshot_id: str) -> dict[str, Any]:
         'unclassified_weight': (payload or {}).get('unclassified_weight'),
         'source_url': (payload or {}).get('source_url') or '',
         'source_type': (payload or {}).get('source_type') or SOURCE_DOWNLOAD,
+        'discovered_via': (payload or {}).get('discovered_via') or '',
         'validation': (payload or {}).get('validation') or None,
         'imported_at': (payload or {}).get('imported_at'),
         'benchmark': (payload or {}).get('benchmark') or None,
@@ -352,9 +365,33 @@ def _read_status(record: dict[str, Any]) -> dict[str, Any]:
     return dict(entry[1]) if entry else {}
 
 
+def _amc_source(record: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """This AMC's health key and its verified source entry, without asking the network."""
+    from .adapters import source_for_amc
+
+    source = source_for_amc(record.get('amc') or '', use_directory=False)
+    return (source or {}).get('key') or _slug(record.get('amc')), source
+
+
 def discovery_due(record: dict[str, Any]) -> bool:
-    """False while a source was checked recently, or is backing off after a failure."""
-    next_check = _read_status(record).get('next_check_at')
+    """False while a source was checked recently, or is backing off after a failure.
+
+    A failure is retried at once, without deleting anything, when it is stale: recorded under an
+    older matcher, an older source configuration or retrieval code, or an AMC-wide failure after
+    which the AMC's source has since worked again.
+    """
+    from . import source_health
+
+    current = _read_status(record)
+    if current.get('status') in RETRY_WITH_NEW_MATCHER and current.get('matcher_version') != MATCHER_VERSION:
+        return True
+    if current.get('status') and current.get('status') != HOLDINGS_AVAILABLE:
+        amc_key, source = _amc_source(record)
+        if current.get('source_fingerprint') and current.get('source_fingerprint') != source_health.source_fingerprint(source):
+            return True
+        if current.get('scope') == 'amc' and source_health.recovered_since(amc_key, current.get('last_checked_at')):
+            return True
+    next_check = current.get('next_check_at')
     if not next_check:
         return True
     try:
@@ -371,23 +408,55 @@ def _previous_month() -> str:
     return (date.today().replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
 
 
-def record_status(record: dict[str, Any], status: str, detail: str = '', latest_month: str | None = None) -> None:
+# An AMC-wide failure is re-checked by the AMC's own circuit, so a fund need not wait long itself.
+AMC_WIDE_RETRY_DELAY = timedelta(hours=1)
+# How recently the AMC must have failed for a fund's failure to be counted as the AMC's.
+AMC_FAILURE_WINDOW = timedelta(minutes=15)
+
+
+def _failure_scope(record: dict[str, Any], status: str, now: datetime) -> tuple[str, str | None, str]:
+    """('amc' or 'scheme', the AMC-level category, the source fingerprint) for this failure."""
+    from . import source_health
+
+    amc_key, source = _amc_source(record)
+    fingerprint = source_health.source_fingerprint(source)
+    if status == HOLDINGS_AVAILABLE:
+        return 'scheme', None, fingerprint
+    failure = source_health.read_health(amc_key).get('last_failure') or {}
+    try:
+        recent = now - datetime.fromisoformat(failure.get('at')) <= AMC_FAILURE_WINDOW
+    except (TypeError, ValueError):
+        recent = False
+    if recent and failure.get('category') in source_health.AMC_WIDE_CATEGORIES and status in (DOWNLOAD_BLOCKED, SOURCE_NOT_SUPPORTED, DOWNLOAD_FAILED, DISCLOSURE_NOT_PUBLISHED):
+        return 'amc', failure.get('category'), fingerprint
+    return 'scheme', None, fingerprint
+
+
+def record_status(record: dict[str, Any], status: str, detail: str = '', latest_month: str | None = None, *, trail: dict[str, Any] | None = None) -> None:
     now = datetime.now(timezone.utc)
     try:
         current = _read_status(record)
         failures = 0 if status == HOLDINGS_AVAILABLE else int(current.get('failures') or 0) + 1
+        scope, category, fingerprint = _failure_scope(record, status, now)
         if status == HOLDINGS_AVAILABLE:
             # Nothing newer can exist until next month's disclosure, so check less often.
             delay = timedelta(hours=24) if latest_month and latest_month >= _previous_month() else timedelta(hours=6)
+        elif scope == 'amc':
+            delay = AMC_WIDE_RETRY_DELAY
         elif status == DOWNLOAD_FAILED:
             delay = min(timedelta(minutes=15) * (2 ** min(failures, 8)), MAX_RETRY_DELAY)
         else:
             delay = RETRY_DELAYS.get(status, MAX_RETRY_DELAY)
         _write_json_atomic(_portfolio_dir(record) / 'status.json', {
+            **({'sources': trail} if trail else {}),
+            'scope': scope,
+            'category': category,
+            'source_fingerprint': fingerprint,
             'amc': record.get('amc') or '',
             'portfolio_key': portfolio_key(record),
             'scheme_name': record.get('scheme_name') or '',
             'status': status,
+            'matcher_version': MATCHER_VERSION,
             'detail': detail[:2000],
             'failures': failures,
             'latest_month': latest_month or current.get('latest_month') or '',

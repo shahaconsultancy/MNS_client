@@ -16,7 +16,8 @@ from .jobs import get_job, start_job
 from .portfolio_store import coverage_report
 from .providers import ProviderError, fetch_amfi_latest
 from .serializers import CompareRequestSerializer, CompareResponseSerializer, FundDetailSerializer, FundSearchResponseSerializer, FundSearchResultSerializer
-from .services import compare_funds, compare_holdings_overlap, fetch_fund_data, fetch_fundamentals, search_funds
+from .scheme_registry import refresh_registry, registry_status
+from .services import SEARCH_RESULT_LIMIT, compare_funds, compare_holdings_overlap, fetch_fund_data, fetch_fundamentals, search_funds
 
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,12 @@ class FundSearchView(APIView):
         if len(query) < 2:
             return Response({'source': 'AMFI', 'asOfDate': None, 'results': []})
         try:
-            payload = search_funds(query)
+            offset = int(request.query_params.get('offset', 0))
+            limit = int(request.query_params.get('limit', SEARCH_RESULT_LIMIT))
+        except (TypeError, ValueError):
+            return Response({'detail': 'offset and limit must be whole numbers'}, status=400)
+        try:
+            payload = search_funds(query, limit=limit, offset=offset)
             payload['results'] = [FundSearchResultSerializer({'source': payload['source'], 'asOfDate': payload['asOfDate'], **row}).data for row in payload['results']]
             return Response(FundSearchResponseSerializer(payload).data)
         except ProviderError as exc:
@@ -199,3 +205,54 @@ class PortfolioCoverageView(APIView):
             return Response({'detail': str(exc)}, status=503)
 
 
+class PortfolioSourceHealthView(APIView):
+    """Staff only: each AMC source's state (Working, Temporarily Unavailable, Access Blocked,
+    Discovery Failed, Parser Issue) with its evidence. Read from the JSON health files; sends no requests."""
+
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        from .source_monitor import health_report
+
+        return Response(health_report())
+
+
+class FundHoldingsDiagnosticView(APIView):
+    """Staff only: why one scheme's holdings are or are not available. Read-only; sends no requests."""
+
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, scheme_code: str):
+        from .diagnostics import diagnose_scheme
+
+        if not scheme_code.isdigit():
+            return Response({'detail': 'Scheme code must be numeric'}, status=400)
+        try:
+            return Response(diagnose_scheme(scheme_code, live=False))
+        except ProviderError as exc:
+            return Response({'detail': str(exc)}, status=503)
+
+
+class SchemeRegistryView(APIView):
+    """When the searchable AMFI scheme list was last updated, how big it is, and any refresh problem."""
+
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'fund_read'
+
+    def get(self, request):
+        return Response(registry_status())
+
+
+class SchemeRegistryRefreshView(APIView):
+    """Admin: download AMFI now. A feed that fails validation is reported and not used."""
+
+    permission_classes = [IsAdminUser]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'fund_import'
+
+    def post(self, request):
+        force = str(request.data.get('force', '')).lower() in ('1', 'true', 'yes')
+        result = refresh_registry(force=force)
+        return Response(result, status={'refreshed': 200, 'busy': 409}.get(result['status'], 502))

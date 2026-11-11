@@ -8,6 +8,7 @@ import { INVESTMENTS } from './tabs/SavingsTab.jsx';
 import { CLASSES } from './tabs/AssetsTab.jsx';
 import { LIABILITIES } from './tabs/LiabilitiesTab.jsx';
 import { GENDERS, RELATIONS } from './tabs/FamilyTab.jsx';
+import { readLoose } from './importLoose.js';
 
 const PRIORITIES = ['High', 'Medium', 'Low'];
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
@@ -39,8 +40,10 @@ const text = (v) => (v instanceof Date ? '' : String(v));
 function isoDate(v) {
   const pad = (x) => String(x).padStart(2, '0');
   if (v instanceof Date) return `${v.getUTCFullYear()}-${pad(v.getUTCMonth() + 1)}-${pad(v.getUTCDate())}`;
-  const s = String(v);
+  const s = String(v).trim();
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const dmy = s.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
+  if (dmy) return `${dmy[3]}-${pad(Number(dmy[2]))}-${pad(Number(dmy[1]))}`;
   const m = s.match(/^(\d{1,2})\s+([A-Za-z]{3})[A-Za-z]*\s+(\d{4})$/);
   const month = m ? MONTHS.indexOf(m[2].toLowerCase()) : -1;
   return month < 0 ? '' : `${m[3]}-${pad(month + 1)}-${pad(Number(m[1]))}`;
@@ -80,7 +83,7 @@ export async function readPlanFile(file, defaults) {
   try {
     await book.xlsx.load(await file.arrayBuffer());
   } catch {
-    throw new Error('Could not read this file. Choose the .xlsx file exported from this plan page.');
+    throw new Error('Could not read this file. The file may be damaged or is not a valid .xlsx workbook.');
   }
 
   const data = {};
@@ -262,8 +265,22 @@ export async function readPlanFile(file, defaults) {
       });
   }
 
+  // Whatever the exported layout did not give us is looked for by field name in every sheet of the file.
+  const loose = readLoose(book, defaults, { plain, num, money, rate, text, isoDate, isTotal });
+  const tabOf = {
+    info: 'client-info', income: 'income', expenses: 'expenses', savings: 'savings', assetData: 'assets',
+    liabilityData: 'liabilities', insurance: 'insurance', goals: 'goals', retirement: 'retirement', family: 'family',
+  };
+  Object.entries(loose.data).forEach(([group, value]) => {
+    if (group in data) return;
+    data[group] = value;
+    fields += loose.count[group] || 0;
+    const label = sheetName(tabOf[group]);
+    if (!tabs.includes(label)) tabs.push(label);
+  });
+
   if (!tabs.length) {
-    throw new Error('No plan sheets found. Import the .xlsx file exported from this plan page.');
+    throw new Error('No matching fields found. Use labels such as Salary income, House rent, Home loan, or a Goals / Family table.');
   }
   return { data, tabs, fields, unmatched, sourceName: typeof sourceName === 'string' ? sourceName : '' };
 }

@@ -17,9 +17,10 @@ const TABS = [
   { key: 'fundamentals', label: 'Fundamentals', icon: PieChart, Component: FundamentalsTab },
 ];
 
-// The selection survives a page refresh. Each signed-in user has their own, and only Clear all forgets it.
+// The selection survives a page refresh. Each signed-in user has their own; Clear all, signing out
+// or signing in again forgets it (see clearFundAnalyzerState in authService).
 const storageKey = () => `mns_fund_analyzer:${getUserEmail() || 'guest'}`;
-const FUND_FIELDS = ['scheme_code', 'scheme_name', 'amc', 'category', 'plan', 'option', 'isin'];
+const FUND_FIELDS = ['scheme_code', 'scheme_name', 'display_name', 'amc', 'category', 'plan', 'option', 'isin'];
 
 function readSaved() {
   try {
@@ -72,16 +73,31 @@ export default function FundAnalyzerPage() {
       .finally(() => { if (current()) setOverlapLoading(false); });
   };
 
+  // Only the newest analysis may change the page, so Clear all (or a newer Update) stops an older one.
+  const compareRequest = useRef(0);
   const load = async (fundsToLoad = selectedFunds) => {
+    const requestId = ++compareRequest.current;
+    const current = () => compareRequest.current === requestId;
     setLoading(true); setError(''); setAnalyzed(true);
     const schemeCodes = fundsToLoad.map((fund) => fund.scheme_code);
     loadOverlap(schemeCodes);
     try {
       const payload = await compareFunds(schemeCodes);
+      if (!current()) return;
       setFunds((payload.funds || []).map((fund, index) => ({ ...fund, color: fundColor(index) })));
       setSource(payload.source || 'AMFI'); setAsOfDate(payload.asOfDate || null); setRiskFreeRate(payload.summary?.riskFreeRate ?? 0.065);
-    } catch (err) { setError(err.message || 'Unable to load live fund data.'); }
-    finally { setLoading(false); }
+    } catch (err) { if (current()) setError(err.message || 'Unable to load live fund data.'); }
+    finally { if (current()) setLoading(false); }
+  };
+
+  const clearAll = () => {
+    // Stop anything still loading, and forget every figure from the last analysis.
+    compareRequest.current += 1;
+    overlapRequest.current += 1;
+    setSelectedFunds([]); setAnalyzed(false); setFunds([]); setFundMetadata({});
+    setOverlap(null); setOverlapLoading(false); setOverlapStage('');
+    setLoading(false); setError(''); setSource('AMFI'); setAsOfDate(null);
+    setFundamentalsLoading(false); setFundamentalsError('');
   };
 
   // Load as soon as the funds are known, so the tab is ready when it is opened.
@@ -139,9 +155,9 @@ export default function FundAnalyzerPage() {
     : funds;
   return <div className="fa">
     <header className="fa__header"><div><p className="fa__eyebrow"><i /> LIVE {source}</p><h1>Fund Analyzer</h1><p className="fa__sub">Compare live AMFI NAV history, returns, risk, holdings overlap and published fund metadata for the schemes you select.</p></div><div className="fa__actions"><button type="button" className="fa__action" onClick={saveReport} disabled={!funds.length || saving} title={funds.length ? 'Save this analysis as a PDF' : 'Run Update analysis first'}><Download size={15} /> {saving ? 'Saving…' : 'Save report'}</button></div></header>
-    <FundPicker selectedFunds={selectedFunds} onChange={setSelectedFunds} onClear={() => { overlapRequest.current += 1; setSelectedFunds([]); setAnalyzed(false); setFunds([]); setFundMetadata({}); setOverlap(null); setOverlapLoading(false); }} onUpdate={() => load()} loading={loading} />
+    <FundPicker selectedFunds={selectedFunds} onChange={setSelectedFunds} onClear={clearAll} onUpdate={() => load()} loading={loading} />
     {error && <p className="fa-notice" role="alert">{error}</p>}
-    {!funds.length && !loading ? <p className="fa-card fa__empty">Select AMFI schemes and press Update analysis to load live figures.</p> : <>{funds.length > 0 && <><SummaryCards funds={funds} overlap={overlap} overlapLoading={overlapLoading} overlapStage={overlapStage} /><div className="fa__tabbar"><nav className="fa__tabs" role="tablist">{TABS.map(({ key, label, icon: Icon }) => <button key={key} type="button" role="tab" aria-selected={activeTab === key} className={`fa__tab${activeTab === key ? ' fa__tab--active' : ''}`} onClick={() => setActiveTab(key)}><Icon size={15} /> {label}</button>)}</nav><span className="fa__navdate">{source} as of {asOfDate || '—'}</span></div><Component funds={displayedFunds} overlap={overlap} overlapLoading={overlapLoading} overlapStage={overlapStage} onHistoricalMonth={(month) => loadOverlap(funds.map((fund) => fund.scheme_code), month)} riskFreeRate={riskFreeRate} loading={fundamentalsLoading} error={fundamentalsError} /></>}</>}
+    {!funds.length && !loading ? <p className="fa-card fa__empty">Select AMFI schemes and press Update analysis to load live figures.</p> : <>{funds.length > 0 && <><SummaryCards funds={funds} overlap={overlap} overlapLoading={overlapLoading} overlapStage={overlapStage} /><div className="fa__tabbar"><nav className="fa__tabs" role="tablist">{TABS.map(({ key, label, icon: Icon }) => <button key={key} type="button" role="tab" aria-selected={activeTab === key} className={`fa__tab${activeTab === key ? ' fa__tab--active' : ''}`} onClick={() => setActiveTab(key)}><Icon size={15} /> {label}</button>)}</nav></div><Component funds={displayedFunds} overlap={overlap} overlapLoading={overlapLoading} overlapStage={overlapStage} onHistoricalMonth={(month) => loadOverlap(funds.map((fund) => fund.scheme_code), month)} riskFreeRate={riskFreeRate} loading={fundamentalsLoading} error={fundamentalsError} /></>}</>}
     <p className="fa__disclaimer">Mutual fund investments are subject to market risks; read all scheme-related documents carefully. Past performance may or may not be sustained in future.</p>
   </div>;
 }

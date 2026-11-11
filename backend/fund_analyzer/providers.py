@@ -42,8 +42,25 @@ class ProviderError(RuntimeError):
     pass
 
 
+class SourceFailure(ProviderError):
+    """A retrieval failure that knows its category, stage and HTTP evidence.
+
+    Still a ProviderError with the same message, so every existing caller keeps working.
+    """
+
+    def __init__(self, message: str, *, category: str | None = None, stage: str | None = None, evidence: dict[str, Any] | None = None, status: str | None = None):
+        super().__init__(message)
+        self.category = category
+        self.stage = stage
+        self.evidence = evidence or {}
+        if status:
+            # Lets adapters.classify_error keep reporting the established per-scheme status.
+            self.status = status
+
+
 def fetch_url(url: str, *, params: dict[str, Any] | None = None, timeout: tuple[int, int] = (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS), attempts: int = MAX_PROVIDER_ATTEMPTS) -> requests.Response:
     last_error: Exception | None = None
+    evidence: dict[str, Any] = {}
     for attempt in range(attempts):
         started = perf_counter()
         try:
@@ -54,10 +71,23 @@ def fetch_url(url: str, *, params: dict[str, Any] | None = None, timeout: tuple[
             return response
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
+            failed = getattr(exc, 'response', None)
+            evidence = _evidence(failed, url, started) if failed is not None else {'url': url.split('?')[0], 'seconds': round(perf_counter() - started, 2), 'error': exc.__class__.__name__}
             logger.warning('Fund Analyzer provider %s failed in %.2fs (attempt %d/%d): %s', urlsplit(url).netloc, perf_counter() - started, attempt + 1, attempts, exc)
             if attempt + 1 < attempts:
                 continue
-    raise ProviderError(str(last_error) if last_error else 'Provider request failed')
+    raise SourceFailure(str(last_error) if last_error else 'Provider request failed', evidence=evidence)
+
+
+def _evidence(response: Any, url: str, started: float) -> dict[str, Any]:
+    from .source_health import evidence_from_response, looks_blocked
+
+    evidence = evidence_from_response(response, url, started)
+    try:
+        evidence['blocked_page'] = looks_blocked(response.text or '')
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return evidence
 
 
 def _cached_provider_value(key: str, loader, *, ttl: int, stale_ttl: int) -> Any:
@@ -113,6 +143,29 @@ def _clean(value: Any) -> str | None:
     return value if value and value != '-' else None
 
 
+def _name_words(value: Any) -> str:
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', str(value or '').lower()).split())
+
+
+def scheme_display_name(record: dict[str, Any]) -> str:
+    """The scheme as investors read it: name, then plan, then option, e.g. 'X Fund - Regular Plan - Growth'.
+
+    AMFI's current NAVAll.txt carries plan and option in their own columns; older rows fold them
+    into the name. A plan or option the name already states is not repeated.
+    """
+    name = ' '.join(str(record.get('scheme_name') or '').split())
+    # AMFI writes some names with a dangling separator ("ICICI Prudential Liquid Fund -"). It is dropped
+    # here, for display only, so the label never reads "Fund - - Direct Plan". scheme_name is unchanged.
+    name = re.sub(r'[\s\-–—:]+$', '', name) or name
+    parts = [name] if name else []
+    for extra in (record.get('plan'), record.get('option')):
+        extra = ' '.join(str(extra or '').split())
+        words = _name_words(extra)
+        if words and f' {words} ' not in f" {_name_words(' '.join(parts))} ":
+            parts.append(extra)
+    return ' - '.join(parts) or str(record.get('scheme_code') or '')
+
+
 def _category_from_header(value: str) -> tuple[str | None, str | None]:
     match = re.match(r'(?P<type>Open|Close|Interval)\s+Ended\s+Schemes?\s*\(\s*(?P<category>.*?)\s*\)', value, re.I)
     if not match:
@@ -120,7 +173,13 @@ def _category_from_header(value: str) -> tuple[str | None, str | None]:
     return match.group('type').title(), match.group('category') or None
 
 
-def parse_amfi_text_data(text: str) -> list[dict[str, Any]]:
+def parse_amfi_text_data(text: str, *, include_unpriced: bool = False) -> list[dict[str, Any]]:
+    """Scheme rows of NAVAll.txt with the AMC and category from the section headings above them.
+
+    By default a row whose NAV is zero or not a number is skipped, because analysis needs a price.
+    The search registry passes include_unpriced=True: such a row is still a real AMFI scheme code
+    (segregated portfolios publish 0), so it is kept with nav None.
+    """
     records: list[dict[str, Any]] = []
     amc: str | None = None
     scheme_type: str | None = None
@@ -147,14 +206,22 @@ def parse_amfi_text_data(text: str) -> list[dict[str, Any]]:
                 plan = option = ''
             else:
                 continue
-            value = float(nav.replace(',', ''))
-            if value <= 0:
-                continue
-            records.append({
+            try:
+                value: float | None = float(nav.replace(',', ''))
+            except ValueError:
+                value = None
+            if value is None or value <= 0:
+                if not include_unpriced:
+                    continue
+                value = None
+            record = {
                 'scheme_code': code, 'isin': _clean(isin_growth) or _clean(isin_reinvest), 'isin_reinvest': _clean(isin_reinvest),
+                'isin_payout_growth': _clean(isin_growth),
                 'scheme_name': name, 'plan': _clean(plan), 'option': _clean(option), 'nav': value,
                 'date': nav_date, 'amc': amc, 'scheme_type': scheme_type, 'category': category,
-            })
+            }
+            record['display_name'] = scheme_display_name(record)
+            records.append(record)
         except (TypeError, ValueError):
             continue
     if not records:
@@ -355,7 +422,8 @@ def fetch_amfi_disclosure_directory() -> dict[str, str]:
             raise ProviderError('AMFI portfolio disclosure directory could not be read')
         return directory
 
-    return _cached_provider_value('fund-analyzer:amfi:disclosure-directory', load, ttl=604800, stale_ttl=2592000)
+    # Refreshed daily; if AMFI is down, the last good directory is used for up to 30 days.
+    return _cached_provider_value('fund-analyzer:amfi:disclosure-directory', load, ttl=86400, stale_ttl=2592000)
 
 
 def _decode_json_text(value: str) -> str:
@@ -373,7 +441,9 @@ def _ter_months() -> list[str]:
 
 
 def _ter_name_key(name: Any) -> str:
-    return re.sub(r'\s+', ' ', str(name or '')).strip().casefold()
+    # AMFI's NAV file writes some names with a dangling separator ("ICICI Prudential Liquid Fund -")
+    # that its TER and AUM files leave out, so a trailing dash or colon is not part of the name.
+    return re.sub(r'[\s\-–—:]+$', '', re.sub(r'\s+', ' ', str(name or '')).strip()).casefold()
 
 
 def _ter_percent(value: Any) -> float | None:

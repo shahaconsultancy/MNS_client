@@ -15,6 +15,7 @@ export async function login({ email, password, remember }) {
   localStorage.removeItem(REFRESH_KEY);
   sessionStorage.removeItem(TOKEN_KEY);
   sessionStorage.removeItem(REFRESH_KEY);
+  clearFundAnalyzerState();
   storage.setItem(TOKEN_KEY, data.access);
   storage.setItem(REFRESH_KEY, data.refresh);
   saveUserEmail(data.user?.email || email.trim().toLowerCase(), remember);
@@ -25,6 +26,19 @@ export function getAccessToken() {
   return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY);
 }
 
+// Fund Analyzer keeps its selection across page refreshes; a new sign-in starts with an empty page.
+const FUND_ANALYZER_PREFIX = 'mns_fund_analyzer:';
+
+function clearFundAnalyzerState() {
+  [localStorage, sessionStorage].forEach((s) => {
+    try {
+      Object.keys(s).filter((key) => key.startsWith(FUND_ANALYZER_PREFIX)).forEach((key) => s.removeItem(key));
+    } catch {
+      // Storage can be blocked; nothing to clear then.
+    }
+  });
+}
+
 export function logout() {
   [localStorage, sessionStorage].forEach((s) => {
     s.removeItem(TOKEN_KEY);
@@ -32,6 +46,7 @@ export function logout() {
     s.removeItem(EMAIL_KEY);
   });
   sessionStorage.removeItem('mns_clients_cache');
+  clearFundAnalyzerState();
 }
 
 const EMAIL_KEY = 'mns_user_email';
