@@ -116,6 +116,12 @@ FUND_ANALYZER_HOLDINGS_CACHE_DIR = os.getenv('FUND_ANALYZER_HOLDINGS_CACHE_DIR')
 # Ask the monthly-portfolio page AMFI's directory lists for an AMC first, then the AMC's own route.
 # Off: the AMC's own route only.
 FUND_ANALYZER_AMFI_FALLBACK_ENABLED = os.getenv('FUND_ANALYZER_AMFI_FALLBACK_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
+# Overlap as a background job (start, then poll) needs one long-lived process with a disk the polls can
+# read. Vercel freezes a function once it has replied, and each request may reach a fresh instance with
+# its own /tmp, so there the page uses the single-request /api/overlap instead. Set this explicitly to
+# override; otherwise jobs are off only where Vercel's own VERCEL variable is present.
+_overlap_jobs = os.getenv('FUND_ANALYZER_OVERLAP_JOBS_ENABLED', '').strip().lower()
+FUND_ANALYZER_OVERLAP_JOBS_ENABLED = _overlap_jobs in ('1', 'true', 'yes', 'on') if _overlap_jobs else not os.getenv('VERCEL')
 if 'test' in sys.argv:
     # Tests must never touch the real cache.
     FUND_ANALYZER_HOLDINGS_CACHE_DIR = tempfile.mkdtemp(prefix='mns-test-portfolio-cache-')
@@ -123,6 +129,8 @@ if 'test' in sys.argv:
     FUND_ANALYZER_AMFI_FALLBACK_ENABLED = False
     # Nor the Charlie Alpha API, whatever a local .env says. Tests of the backup switch it on with mocks.
     FUND_ANALYZER_CHARLIE_ALPHA_ENABLED = False
+    # The job workflow is tested as it runs locally; tests of the serverless mode switch it off.
+    FUND_ANALYZER_OVERLAP_JOBS_ENABLED = True
 
 # The searchable AMFI scheme list. It is downloaded again once it is this old, and a download with
 # fewer schemes than the minimum, or a fall larger than the percentage, is rejected and not used.
