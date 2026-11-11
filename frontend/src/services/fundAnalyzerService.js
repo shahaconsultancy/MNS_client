@@ -15,10 +15,21 @@ export async function getFundamentals(schemeCodes) {
   return data;
 }
 
+// The single-request overlap does all its work before it answers, so it may take a while on a first
+// retrieval. Past this the browser stops waiting; the server's own limit may end it sooner (HTTP 504).
+const SYNC_OVERLAP_TIMEOUT_MS = 5 * 60 * 1000;
+export const OVERLAP_TIMEOUT_MESSAGE = 'Calculating the overlap took longer than the server allows. Press Update analysis again; holdings already retrieved are reused.';
+
 // portfolioMonth (YYYY-MM) asks for historical overlap: every fund is compared on that one month.
+// A time-out gets its own message. Any other failure keeps the server's own reason.
 export async function getHoldingsOverlap(schemeCodes, portfolioMonth) {
-  const { data } = await axiosClient.post('/overlap', { scheme_codes: schemeCodes, ...(portfolioMonth ? { portfolio_month: portfolioMonth } : {}) });
-  return data;
+  try {
+    const { data } = await axiosClient.post('/overlap', { scheme_codes: schemeCodes, ...(portfolioMonth ? { portfolio_month: portfolioMonth } : {}) }, { timeout: SYNC_OVERLAP_TIMEOUT_MS });
+    return data;
+  } catch (error) {
+    if (error.code === 'ECONNABORTED' || error.response?.status === 504) throw new Error(OVERLAP_TIMEOUT_MESSAGE);
+    throw error;
+  }
 }
 
 // A job answered from saved holdings is done in a fraction of a second, so ask soon, then slow down to once a second.
@@ -29,14 +40,17 @@ const pause = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 // Starts the overlap as a job and polls it, so a slow first retrieval never blocks the page.
 // onStage receives the server's own stage text. isCancelled stops polling once the answer is not wanted.
-// If the server has no job endpoint, falls back to the single request.
+// Where the server runs no jobs (405, as on Vercel) the single request is used instead. If a running job
+// goes missing (404: on serverless hosting the instance that held it can be gone), the single request is
+// tried once. It never comes back here, so there is no retry loop.
 export async function getHoldingsOverlapWithProgress(schemeCodes, portfolioMonth, onStage = () => {}, isCancelled = () => false) {
+  const synchronous = () => { onStage('Calculating overlap...'); return getHoldingsOverlap(schemeCodes, portfolioMonth); };
   let job;
   try {
     const { data } = await axiosClient.post('/overlap/jobs', { scheme_codes: schemeCodes, ...(portfolioMonth ? { portfolio_month: portfolioMonth } : {}) });
     job = data;
   } catch (error) {
-    if (error.response?.status === 404 || error.response?.status === 405) return getHoldingsOverlap(schemeCodes, portfolioMonth);
+    if (error.response?.status === 404 || error.response?.status === 405) return synchronous();
     throw error;
   }
   const started = Date.now();
@@ -52,7 +66,7 @@ export async function getHoldingsOverlapWithProgress(schemeCodes, portfolioMonth
     try {
       ({ data: job } = await axiosClient.get(`/overlap/jobs/${job.job_id}`));
     } catch (error) {
-      if (error.response?.status === 404) throw new Error('The overlap request expired. Press Update analysis again.');
+      if (error.response?.status === 404) return isCancelled() ? null : synchronous();
       throw error;
     }
   }

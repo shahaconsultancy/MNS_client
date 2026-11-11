@@ -137,6 +137,10 @@ class FundOverlapJobView(APIView):
     throttle_scope = 'fund_analysis'
 
     def post(self, request):
+        if not settings.FUND_ANALYZER_OVERLAP_JOBS_ENABLED:
+            # Serverless (Vercel): a job would outlive its function and be lost. 405 makes the page use
+            # POST /api/overlap, which runs the same calculation in this one request.
+            return Response({'detail': 'Background overlap jobs are not available on this deployment. Use POST /api/overlap.', 'mode': 'synchronous'}, status=405)
         request_serializer = CompareRequestSerializer(data=request.data)
         if not request_serializer.is_valid():
             return Response({'detail': request_serializer.errors, 'available': False}, status=400)
