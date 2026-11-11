@@ -205,6 +205,34 @@ class PortfolioCoverageView(APIView):
             return Response({'detail': str(exc)}, status=503)
 
 
+class PortfolioSourceHealthView(APIView):
+    """Staff only: each AMC source's state (Working, Temporarily Unavailable, Access Blocked,
+    Discovery Failed, Parser Issue) with its evidence. Read from the JSON health files; sends no requests."""
+
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        from .source_monitor import health_report
+
+        return Response(health_report())
+
+
+class FundHoldingsDiagnosticView(APIView):
+    """Staff only: why one scheme's holdings are or are not available. Read-only; sends no requests."""
+
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, scheme_code: str):
+        from .diagnostics import diagnose_scheme
+
+        if not scheme_code.isdigit():
+            return Response({'detail': 'Scheme code must be numeric'}, status=400)
+        try:
+            return Response(diagnose_scheme(scheme_code, live=False))
+        except ProviderError as exc:
+            return Response({'detail': str(exc)}, status=503)
+
+
 class SchemeRegistryView(APIView):
     """When the searchable AMFI scheme list was last updated, how big it is, and any refresh problem."""
 

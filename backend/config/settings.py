@@ -113,9 +113,16 @@ FUND_ANALYZER_CHARLIE_ALPHA_MAX_REQUESTS = max(1, int(os.getenv('FUND_ANALYZER_C
 FUND_ANALYZER_HOLDINGS_CACHE_DIR = os.getenv('FUND_ANALYZER_HOLDINGS_CACHE_DIR') or str(
     Path(tempfile.gettempdir()) / 'mns-portfolio-cache' if os.getenv('VERCEL') else BASE_DIR / 'portfolio_cache'
 )
+# Ask the monthly-portfolio page AMFI's directory lists for an AMC first, then the AMC's own route.
+# Off: the AMC's own route only.
+FUND_ANALYZER_AMFI_FALLBACK_ENABLED = os.getenv('FUND_ANALYZER_AMFI_FALLBACK_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
 if 'test' in sys.argv:
     # Tests must never touch the real cache.
     FUND_ANALYZER_HOLDINGS_CACHE_DIR = tempfile.mkdtemp(prefix='mns-test-portfolio-cache-')
+    # Nor reach AMFI's directory through mocked AMC sources. Tests of the fallback switch it on.
+    FUND_ANALYZER_AMFI_FALLBACK_ENABLED = False
+    # Nor the Charlie Alpha API, whatever a local .env says. Tests of the backup switch it on with mocks.
+    FUND_ANALYZER_CHARLIE_ALPHA_ENABLED = False
 
 # The searchable AMFI scheme list. It is downloaded again once it is this old, and a download with
 # fewer schemes than the minimum, or a fall larger than the percentage, is rejected and not used.

@@ -227,6 +227,13 @@
 
 .fa-picker__update svg { color: var(--color-yellow); }
 .fa-picker__update:disabled { opacity: 0.45; cursor: default; }
+/* Nothing selected: plainly unavailable, so it is never mistaken for "loading". */
+.fa-picker__update--empty:disabled { opacity: 1; background: #eef1f6; color: #8a93a6; cursor: not-allowed; }
+.fa-picker__update--empty svg { color: #8a93a6; }
+/* Working: keeps its colour and shows a spinning icon. */
+.fa-picker__update--loading:disabled { opacity: 0.85; cursor: progress; }
+.fa-picker__update--loading svg { animation: fa-spin 0.9s linear infinite; }
+@keyframes fa-spin { to { transform: rotate(360deg); } }
 
 /* Summary cards */
 .fa-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
@@ -294,7 +301,6 @@
 
 .fa__tab--active svg { color: var(--color-yellow); }
 
-.fa__navdate { font-size: 12px; color: var(--color-gray); }
 
 .fa-section-head { padding: 22px 24px 16px; }
 .fa-section-head--flush { padding: 0 0 14px; }

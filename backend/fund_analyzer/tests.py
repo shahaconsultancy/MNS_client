@@ -282,6 +282,7 @@ class FundHoldingsTests(PortfolioCacheMixin, SimpleTestCase):
             ],
             'holdings_as_of': '2026-09-30',
             'holdings_source': 'official_amc',
+            'holdings_source_label': 'Official AMC',
             'benchmark': 'NIFTY 500 TRI',
             'allocation': {'indian_equity': 10.46, 'international_equity': 2.0, 'other': 87.54},
             'sectors': [

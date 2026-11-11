@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { LineChart, Search, Trash2, X } from 'lucide-react';
+import { LineChart, Loader2, Search, Trash2, X } from 'lucide-react';
 import { fundColor } from '../fundData.js';
 import { searchFunds } from '../../../services/fundAnalyzerService.js';
 
@@ -92,7 +92,7 @@ export default function FundPicker({ selectedFunds, onChange, onClear, onUpdate,
         </div>}
       </div>
       {selectedFunds.length > 0 && <ul className="fa-chips">{selectedFunds.map((fund, i) => <li key={fund.scheme_code} className="fa-chip"><i style={{ background: fundColor(i) }} /><strong>{fundLabel(fund)}</strong><small>{fund.scheme_code}</small><button type="button" aria-label={`Remove ${fundLabel(fund)}`} onClick={() => onChange(selectedFunds.filter((item) => item.scheme_code !== fund.scheme_code))}><X size={13} /></button></li>)}</ul>}
-      <div className="fa-picker__foot"><div className="fa-picker__count">{selectedFunds.length} {selectedFunds.length === 1 ? 'fund' : 'funds'} selected</div><button type="button" className="fa-picker__update" disabled={!selectedFunds.length || loading} onClick={onUpdate}><LineChart size={15} /> {loading ? 'Loading live data…' : 'Update analysis'}</button></div>
+      <div className="fa-picker__foot"><div className="fa-picker__count">{selectedFunds.length} {selectedFunds.length === 1 ? 'fund' : 'funds'} selected</div><button type="button" className={`fa-picker__update${loading ? ' fa-picker__update--loading' : !selectedFunds.length ? ' fa-picker__update--empty' : ''}`} disabled={!selectedFunds.length || loading} title={!selectedFunds.length && !loading ? 'Select at least one fund to compare' : undefined} onClick={onUpdate}>{loading ? <Loader2 size={15} /> : <LineChart size={15} />} {loading ? 'Loading live data…' : 'Update analysis'}</button></div>
     </section>
   );
 }

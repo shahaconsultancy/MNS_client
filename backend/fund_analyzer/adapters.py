@@ -6,12 +6,17 @@ Add an AMC by adding an adapter, without changing the overlap formula or the fro
 """
 from __future__ import annotations
 
+import json
+import logging
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from .providers import ProviderError, fetch_amfi_disclosure_directory
+
+logger = logging.getLogger(__name__)
 
 # Structured retrieval statuses, used in logs and the internal coverage report.
 SOURCE_NOT_SUPPORTED = 'SOURCE_NOT_SUPPORTED'
@@ -159,7 +164,8 @@ class AmcAdapter:
 
     def is_candidate(self, text: str, href: str) -> bool:
         combined = f'{text} {href}'.lower()
-        if not urlsplit(href).path.lower().endswith(('.xls', '.xlsx')):
+        # Some AMCs publish the month as a ZIP of workbooks. Its contents are checked like any file.
+        if not urlsplit(href).path.lower().endswith(('.xls', '.xlsx', '.zip')):
             return False
         if 'fortnight' in combined or 'half-year' in combined or 'half yearly' in combined:
             return False
@@ -264,7 +270,45 @@ class DirectoryAdapter(AmcAdapter):
         return selected
 
 
-_ADAPTERS = {adapter.parser: adapter for adapter in (HdfcAdapter, PpfasAdapter, NipponAdapter, SbiAdapter, DirectoryAdapter)}
+class ListingApiAdapter(DirectoryAdapter):
+    """An AMC whose page fills its file list from a public listing request (see listings.py).
+
+    The listing already names the monthly portfolio section, so every file it returns for a month is
+    a candidate, AMC-wide. The workbook or archive is then searched for the scheme as always.
+    """
+
+    def select_links(self, links, fund_name):
+        by_month: dict[str, list[dict[str, str]]] = {}
+        for link in links:
+            by_month.setdefault(link['month'], []).append(link)
+        return [link for month_links in by_month.values() for link in month_links[:MAX_DIRECTORY_LINKS_PER_MONTH]]
+
+
+class WordpressAjaxAdapter(ListingApiAdapter):
+    parser = 'wordpress_ajax_listing'
+
+
+class JsonDownloadsApiAdapter(ListingApiAdapter):
+    parser = 'json_downloads_api'
+
+
+class ManualImportAdapter(AmcAdapter):
+    """No automated source: the AMC restricts automated access, or no adapter exists for its site.
+
+    Nothing is requested. Stored months, staff uploads and the authorised backup still answer.
+    """
+
+    parser = 'manual_import'
+
+    def is_candidate(self, text: str, href: str) -> bool:
+        return False
+
+
+_ADAPTERS = {adapter.parser: adapter for adapter in (HdfcAdapter, PpfasAdapter, NipponAdapter, SbiAdapter, DirectoryAdapter, WordpressAjaxAdapter, JsonDownloadsApiAdapter, ManualImportAdapter)}
+# Discovery methods that ask nothing of the AMC's website.
+NO_AUTOMATED_DISCOVERY = frozenset({ManualImportAdapter.parser})
+REGISTRY_FILE = Path(__file__).with_name('amc_sources.json')
+_registry_cache: tuple[float, dict[str, dict[str, Any]]] | None = None
 AMC_SOURCES = {
     'HDFC Mutual Fund': {
         'key': 'hdfc',
@@ -304,12 +348,94 @@ def candidate_link(parser_key: str, text: str, href: str) -> bool:
 
 
 def official_domains(amc_key: str) -> list[str]:
+    if amc_key not in _official_domains:
+        registry_sources()
     return _official_domains.get(amc_key, [])
 
 
+VIA_AMC_PAGE = 'amc_page'
+VIA_AMFI_DIRECTORY = 'amfi_directory'
+AMFI_SOURCE_SUFFIX = '--amfi'
+
+
+def normalised_page(url: str) -> str:
+    """One spelling per page: lower-case host, no fragment, no trailing slash."""
+    parts = urlsplit(str(url or '').strip())
+    query = f'?{parts.query}' if parts.query else ''
+    return f"{parts.scheme.lower()}://{(parts.hostname or '').lower()}{parts.path.rstrip('/')}{query}"
+
+
+def amfi_route(amc_name: str, primary: dict[str, Any] | None) -> tuple[dict[str, Any] | None, str]:
+    """The location AMFI's portfolio-disclosure directory lists for this AMC, as the first discovery route.
+
+    AMFI only links to the AMC's own page; it does not host portfolio files. Returns (route, '') or
+    (None, why not). route['same_as_direct'] is True when AMFI lists the very page the AMC's own route
+    reads, so one request serves both. A different page is used only on the AMC's official domain (how
+    the AMC's identity is checked), never for an AMC that restricts automated access, and never while
+    its host is recorded as blocking us. The directory itself is cached daily, not fetched per request.
+    """
+    if not primary:
+        return None, 'no official source is known for this AMC'
+    if primary.get('access') == 'restricted':
+        if primary.get('restricted_route') == 'data_api':
+            return None, "the AMC's portfolio data API refuses automated requests (its web page loads)"
+        return None, 'the AMC restricts automated access'
+    if amc_name not in AMC_SOURCES and amc_name not in registry_sources():
+        # This AMC's page already comes from AMFI's directory (or its validated replacement).
+        return {**primary, 'same_as_direct': True}, ''
+    try:
+        url = fetch_amfi_disclosure_directory().get(amc_name)
+    except ProviderError as exc:
+        return None, f'AMFI directory unavailable: {exc}'
+    if not url:
+        return None, 'AMFI lists no monthly portfolio page for this AMC'
+    if normalised_page(url) == normalised_page(primary.get('url') or ''):
+        return {**primary, 'same_as_direct': True}, ''
+    domains = list(primary.get('domains') or official_domains(primary.get('key') or '') or [])
+    if not domains or not is_official_url(url, domains):
+        return None, f'AMFI links to {urlsplit(url).hostname}, which is not an official domain of this AMC'
+    from .source_health import ACCESS_BLOCKED, circuit_open, read_health
+
+    key = f"{primary['key']}{AMFI_SOURCE_SUFFIX}"
+    landed = (read_health(key).get('last_success_evidence') or {}).get('final_url')
+    if landed and normalised_page(landed) == normalised_page(primary.get('url') or ''):
+        # AMFI's link was seen to redirect to the very page the AMC route reads: one destination, one request.
+        return {**primary, 'same_as_direct': True, 'amfi_url': url}, ''
+
+    host = (urlsplit(url).hostname or '').lower()
+    blocked = circuit_open(primary['key'])
+    failure = (blocked or {}).get('last_failure') or {}
+    blocked_host = (urlsplit((failure.get('evidence') or {}).get('final_url') or (failure.get('evidence') or {}).get('url') or primary.get('url') or '').hostname or '').lower()
+    if failure.get('category') == ACCESS_BLOCKED and blocked_host == host:
+        return None, f'{host} is refusing automated requests (access blocked); not asked again'
+    _official_domains[key] = domains
+    return {'key': key, 'url': url, 'parser': DirectoryAdapter.parser, 'domains': domains, 'amc': amc_name, 'via': VIA_AMFI_DIRECTORY, 'primary_key': primary['key']}, ''
+
+
+def registry_sources() -> dict[str, dict[str, Any]]:
+    """Verified sources from amc_sources.json, keyed by AMFI AMC name. Re-read when the file changes."""
+    global _registry_cache
+    try:
+        mtime = REGISTRY_FILE.stat().st_mtime
+    except OSError:
+        return {}
+    if _registry_cache and _registry_cache[0] == mtime:
+        return _registry_cache[1]
+    try:
+        payload = json.loads(REGISTRY_FILE.read_text(encoding='utf-8'))
+        entries = {name: dict(entry) for name, entry in (payload.get('amcs') or {}).items() if entry.get('parser') in _ADAPTERS and entry.get('url') and entry.get('key')}
+    except (OSError, ValueError, AttributeError) as exc:
+        logger.error('AMC source registry could not be read: %s', exc)
+        return _registry_cache[1] if _registry_cache else {}
+    for entry in entries.values():
+        _official_domains[entry['key']] = list(entry.get('domains') or [registered_domain(urlsplit(entry['url']).hostname or '')])
+    _registry_cache = (mtime, entries)
+    return entries
+
+
 def source_for_amc(amc_name: str, *, use_directory: bool = True) -> dict[str, Any] | None:
-    """The AMC's source: a dedicated adapter, or the page AMFI's directory lists for it."""
-    source = AMC_SOURCES.get(amc_name)
+    """The AMC's source: a dedicated adapter, a verified registry entry, or the page AMFI's directory lists."""
+    source = AMC_SOURCES.get(amc_name) or registry_sources().get(amc_name)
     if source or not use_directory:
         return source
     try:
@@ -321,4 +447,12 @@ def source_for_amc(amc_name: str, *, use_directory: bool = True) -> dict[str, An
     key = re.sub(r'[^a-z0-9]+', '-', amc_name.lower()).strip('-')
     domains = [registered_domain(urlsplit(url).hostname)]
     _official_domains[key] = domains
+    # The scheduled check may have found and validated the AMC's moved page on its own domain.
+    # It stands in only while AMFI still lists the address it replaced.
+    from .source_health import read_health
+
+    health = read_health(key)
+    recovered = health.get('recovered_url')
+    if recovered and health.get('recovered_from') == url and is_official_url(recovered, domains):
+        url = recovered
     return {'key': key, 'url': url, 'parser': DirectoryAdapter.parser, 'domains': domains}

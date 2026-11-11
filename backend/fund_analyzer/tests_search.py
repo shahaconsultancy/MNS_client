@@ -290,3 +290,13 @@ class UnpricedSchemeAnalysisTests(SimpleTestCase):
         history = [{'date': f'2026-{month:02d}-01', 'nav': 10 + month} for month in range(1, 13)]
         self.assertEqual(_metrics_or_reason(history, 0.065, '1'), (metrics(history, 0.065), None))
         self.assertEqual(_metrics_or_reason([], 0.065, '1'), (None, None))
+
+
+class DisplayNameSeparatorTests(SimpleTestCase):
+    def test_amfis_trailing_dash_is_not_doubled_in_the_label(self):
+        from .providers import scheme_display_name
+
+        record = {'scheme_code': '120197', 'scheme_name': 'ICICI Prudential Liquid Fund -', 'plan': 'Direct Plan', 'option': 'Growth'}
+        self.assertEqual(scheme_display_name(record), 'ICICI Prudential Liquid Fund - Direct Plan - Growth')
+        self.assertEqual(record['scheme_name'], 'ICICI Prudential Liquid Fund -')
+        self.assertEqual(scheme_display_name({'scheme_name': 'X Fund - Series A', 'plan': '', 'option': ''}), 'X Fund - Series A')

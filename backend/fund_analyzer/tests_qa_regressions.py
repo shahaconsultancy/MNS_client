@@ -133,3 +133,38 @@ class ErrorResponseTests(SimpleTestCase):
     def test_detail_still_works_when_the_scheme_list_is_down(self):
         with patch('fund_analyzer.views.fetch_amfi_latest', side_effect=ProviderError('down')), patch('fund_analyzer.views.fetch_fund_data', side_effect=ProviderError(self.INTERNAL)):
             self.assert_clean(self.client.get('/api/funds/3'))
+
+
+class TrailingSeparatorNameTests(SimpleTestCase):
+    """AMFI's NAV file names some schemes 'ICICI Prudential Liquid Fund -'; its TER and AUM files drop the dash."""
+
+    # The real rows of AMFI's ICICI scheme-wise AAUM report, quarter to 30 Sept 2026 (lakhs).
+    LIQUID_AUM_ROWS = [
+        ('ICICI Prudential Liquid Fund - Daily IDCW', 16585.64),
+        ('ICICI Prudential Liquid Fund - Direct Plan - IDCW Others', 589.45),
+        ('ICICI Prudential Liquid Fund - Direct Plan - Daily IDCW', 11961.45),
+        ('ICICI Prudential Liquid Fund - Direct Plan - Growth', 5145815.73),
+        ('ICICI Prudential Liquid Fund - Direct Plan - Weekly IDCW', 57017.27),
+        ('ICICI Prudential Liquid Fund - Growth', 1304686.36),
+        ('ICICI Prudential Liquid Fund - IDCW Others', 1166.14),
+        ('ICICI Prudential Liquid Fund - Weekly IDCW', 3703.7),
+        ('ICICI Prudential BSE Liquid Rate ETF - Growth', 999.0),
+    ]
+
+    def test_name_key_ignores_a_trailing_separator(self):
+        self.assertEqual(providers._ter_name_key('ICICI Prudential Liquid Fund -'), providers._ter_name_key('ICICI Prudential Liquid Fund'))
+        self.assertEqual(providers._ter_name_key('  Some  Fund :  '), 'some fund')
+        # A dash inside the name is kept.
+        self.assertEqual(providers._ter_name_key('ICICI Prudential Nifty 50 Index Fund - Series A'), 'icici prudential nifty 50 index fund - series a')
+
+    def test_aum_adds_every_plan_row_of_the_scheme_only(self):
+        expected = round(sum(value for name, value in self.LIQUID_AUM_ROWS if 'Liquid Fund' in name), 2)
+        self.assertEqual(round(providers._scheme_aum(self.LIQUID_AUM_ROWS, 'ICICI Prudential Liquid Fund -'), 2), expected)
+        self.assertEqual(round(providers._scheme_aum(self.LIQUID_AUM_ROWS, 'ICICI Prudential Liquid Fund'), 2), expected)
+
+    def test_ter_found_for_a_name_with_a_trailing_dash(self):
+        table = {providers._ter_name_key('ICICI Prudential Liquid Fund'): {'ICIC/O/D/LIF/98/05/0007': ('2026-11-08', 0.3, 0.2)}}
+        record = {'scheme_code': '120197', 'scheme_name': 'ICICI Prudential Liquid Fund -', 'plan': 'Direct Plan', 'option': 'Growth', 'amc': 'ICICI Prudential Mutual Fund'}
+        with patch.object(providers, '_ter_amc_ids', return_value={'ICICI Prudential Mutual Fund': 20}), patch.object(providers, '_ter_months', return_value=['11-2026']), patch.object(providers, '_fetch_ter_table', return_value=table):
+            self.assertEqual(providers._ter_for_record(record), (0.2, '2026-11-08'))
+            self.assertEqual(providers._ter_for_record({**record, 'scheme_code': '103340', 'plan': 'Regular Plan'}), (0.3, '2026-11-08'))

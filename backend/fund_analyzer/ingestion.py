@@ -17,7 +17,7 @@ from .adapters import (
     classify_error,
     source_for_amc,
 )
-from .holdings import _holdings_from_link, _link_error_status, _monthly_files_for_fund, _overlap_debug_record, _recent_portfolio_months
+from .holdings import _discover_files, _holdings_from_link, _link_error_status, _monthly_files_for_fund, _overlap_debug_record, _recent_portfolio_months
 from .portfolio_store import discovery_due, file_scheme_name, is_eligible_equity, portfolio_key, record_status, stored_links
 from .providers import ProviderError, fetch_amfi_latest
 
@@ -63,7 +63,8 @@ def ingest_portfolio(record: dict[str, Any], source: dict[str, Any], *, months_t
     recent_months = _recent_portfolio_months()
     stored = {link['month'] for link in stored_links(record)}
     try:
-        links = _monthly_files_for_fund(source, name)
+        # AMFI-listed location first, then the AMC's own route (see holdings._discover_files).
+        links = _discover_files(source, name, amc_name=record.get('amc') or '', cached_months=stored, direct=lambda *args: _monthly_files_for_fund(*args))
     except ProviderError as exc:
         status = classify_error(exc)
         if stored:

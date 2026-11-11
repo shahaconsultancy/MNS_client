@@ -42,8 +42,25 @@ class ProviderError(RuntimeError):
     pass
 
 
+class SourceFailure(ProviderError):
+    """A retrieval failure that knows its category, stage and HTTP evidence.
+
+    Still a ProviderError with the same message, so every existing caller keeps working.
+    """
+
+    def __init__(self, message: str, *, category: str | None = None, stage: str | None = None, evidence: dict[str, Any] | None = None, status: str | None = None):
+        super().__init__(message)
+        self.category = category
+        self.stage = stage
+        self.evidence = evidence or {}
+        if status:
+            # Lets adapters.classify_error keep reporting the established per-scheme status.
+            self.status = status
+
+
 def fetch_url(url: str, *, params: dict[str, Any] | None = None, timeout: tuple[int, int] = (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS), attempts: int = MAX_PROVIDER_ATTEMPTS) -> requests.Response:
     last_error: Exception | None = None
+    evidence: dict[str, Any] = {}
     for attempt in range(attempts):
         started = perf_counter()
         try:
@@ -54,10 +71,23 @@ def fetch_url(url: str, *, params: dict[str, Any] | None = None, timeout: tuple[
             return response
         except (requests.RequestException, ValueError) as exc:
             last_error = exc
+            failed = getattr(exc, 'response', None)
+            evidence = _evidence(failed, url, started) if failed is not None else {'url': url.split('?')[0], 'seconds': round(perf_counter() - started, 2), 'error': exc.__class__.__name__}
             logger.warning('Fund Analyzer provider %s failed in %.2fs (attempt %d/%d): %s', urlsplit(url).netloc, perf_counter() - started, attempt + 1, attempts, exc)
             if attempt + 1 < attempts:
                 continue
-    raise ProviderError(str(last_error) if last_error else 'Provider request failed')
+    raise SourceFailure(str(last_error) if last_error else 'Provider request failed', evidence=evidence)
+
+
+def _evidence(response: Any, url: str, started: float) -> dict[str, Any]:
+    from .source_health import evidence_from_response, looks_blocked
+
+    evidence = evidence_from_response(response, url, started)
+    try:
+        evidence['blocked_page'] = looks_blocked(response.text or '')
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return evidence
 
 
 def _cached_provider_value(key: str, loader, *, ttl: int, stale_ttl: int) -> Any:
@@ -124,6 +154,9 @@ def scheme_display_name(record: dict[str, Any]) -> str:
     into the name. A plan or option the name already states is not repeated.
     """
     name = ' '.join(str(record.get('scheme_name') or '').split())
+    # AMFI writes some names with a dangling separator ("ICICI Prudential Liquid Fund -"). It is dropped
+    # here, for display only, so the label never reads "Fund - - Direct Plan". scheme_name is unchanged.
+    name = re.sub(r'[\s\-–—:]+$', '', name) or name
     parts = [name] if name else []
     for extra in (record.get('plan'), record.get('option')):
         extra = ' '.join(str(extra or '').split())
@@ -389,7 +422,8 @@ def fetch_amfi_disclosure_directory() -> dict[str, str]:
             raise ProviderError('AMFI portfolio disclosure directory could not be read')
         return directory
 
-    return _cached_provider_value('fund-analyzer:amfi:disclosure-directory', load, ttl=604800, stale_ttl=2592000)
+    # Refreshed daily; if AMFI is down, the last good directory is used for up to 30 days.
+    return _cached_provider_value('fund-analyzer:amfi:disclosure-directory', load, ttl=86400, stale_ttl=2592000)
 
 
 def _decode_json_text(value: str) -> str:
@@ -407,7 +441,9 @@ def _ter_months() -> list[str]:
 
 
 def _ter_name_key(name: Any) -> str:
-    return re.sub(r'\s+', ' ', str(name or '')).strip().casefold()
+    # AMFI's NAV file writes some names with a dangling separator ("ICICI Prudential Liquid Fund -")
+    # that its TER and AUM files leave out, so a trailing dash or colon is not part of the name.
+    return re.sub(r'[\s\-–—:]+$', '', re.sub(r'\s+', ' ', str(name or '')).strip()).casefold()
 
 
 def _ter_percent(value: Any) -> float | None:

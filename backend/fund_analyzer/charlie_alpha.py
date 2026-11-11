@@ -36,7 +36,12 @@ logger = logging.getLogger(__name__)
 
 SOURCE_OFFICIAL = 'official_amc'
 SOURCE_THIRD_PARTY = 'charlie_alpha'
-SOURCE_LABELS = {SOURCE_OFFICIAL: 'Official AMC', SOURCE_THIRD_PARTY: 'Third-party API'}
+SOURCE_LABELS = {SOURCE_OFFICIAL: 'Official AMC', SOURCE_THIRD_PARTY: 'Third-party API — Charlie Alpha', 'mixed': 'Official AMC and Third-party API — Charlie Alpha'}
+
+
+def source_label(source: str | None) -> str:
+    """How a holdings source is named in API data and records (official_amc, charlie_alpha or mixed)."""
+    return SOURCE_LABELS.get(source or SOURCE_OFFICIAL, SOURCE_LABELS[SOURCE_OFFICIAL])
 
 # Failure codes. None of them is ever shown to a client as raw text.
 DISABLED = 'BACKUP_DISABLED'
