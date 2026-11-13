@@ -159,7 +159,7 @@ export default function ClientPlanPage() {
     setExporting(true);
     setSaveError('');
     try {
-      await write(planState);
+      await write({ ...planState, planName: client.plan_name });
     } catch (err) {
       setSaveError(`Export failed: ${err.message}`);
     } finally {
