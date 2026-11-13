@@ -43,6 +43,8 @@ export function buildReport(s) {
     row('Address', txt(info.address)),
     row('Plan date', date(info.planDate)),
     row('Advisor notes', txt(info.advisorNotes)),
+    row('Plan name', txt(s.planName || info.clientName)),
+    row('Prepared by', 'Money Navigating Solutions'),
   ])];
 
   // ---- Income
@@ -59,10 +61,13 @@ export function buildReport(s) {
   const catTotal = (c) => c.items.reduce((sum, _, i) => sum + n(expenses[`${c.key}-${i}`]), 0);
   const expenseBlocks = CATEGORIES.map((c) => ({
     title: c.label,
-    cols: [col('Expense'), col('Monthly', 'inr'), col('% of expenses', 'pct')],
+    cols: [col('Expense'), col('Monthly', 'inr'), col('Yearly', 'inr'), col('% of income', 'pct'), col('% of expenses', 'pct')],
     rows: [
-      ...c.items.map((item, i) => row(item, n(expenses[`${c.key}-${i}`]), share(n(expenses[`${c.key}-${i}`]), expensesAmount))),
-      total(`${c.label} total`, catTotal(c), share(catTotal(c), expensesAmount)),
+      ...c.items.map((item, i) => {
+        const v = n(expenses[`${c.key}-${i}`]);
+        return row(item, v, v * 12, share(v, incomeAmount), share(v, expensesAmount));
+      }),
+      total(`${c.label} total`, catTotal(c), catTotal(c) * 12, share(catTotal(c), incomeAmount), share(catTotal(c), expensesAmount)),
     ],
   }));
   expenseBlocks.push({
@@ -83,6 +88,18 @@ export function buildReport(s) {
       total('Total investments', investedAmount, investedAmount * 12, investedAmount ? 100 : 0),
     ],
   }];
+
+  savingsBlocks.push({
+    title: 'Savings summary',
+    cols: [col('Particulars'), col('Monthly', 'inr'), col('Yearly', 'inr')],
+    rows: [
+      row('Total income', incomeAmount, incomeAmount * 12),
+      row('Total expenses', expensesAmount, expensesAmount * 12),
+      row('Total savings', incomeAmount - expensesAmount, (incomeAmount - expensesAmount) * 12),
+      row('Total ongoing investments', investedAmount, investedAmount * 12),
+      total('Surplus for new investments', surplus, surplus * 12),
+    ],
+  });
 
   // ---- Assets
   const assetBlocks = [{
@@ -175,21 +192,22 @@ export function buildReport(s) {
     cols: [
       col('Goal'), col('Priority'), col('Cost today', 'inr'), col('Years', 'num'), col('Inflation', 'pct'), col('Expected return', 'pct'),
       col('Current savings', 'inr'), col('Monthly SIP', 'inr'), col('Future target', 'inr'), col('Projected corpus', 'inr'),
-      col('Funded', 'pct'), col('Surplus / shortfall', 'inr'), col('SIP to fully fund', 'inr'),
+      col('Funded', 'pct'), col('Surplus / shortfall', 'inr'), col('SIP to fully fund', 'inr'), col('Status'),
     ],
     rows: goals.length
       ? [
           ...goals.map((g, i) => row(
             g.name, g.priority, n(g.cost), n(g.years), n(g.inflation), n(g.ret), n(g.savings), n(g.sip),
             calcs[i].target, calcs[i].corpus, calcs[i].funded, calcs[i].corpus - calcs[i].target, calcs[i].needSip,
+            calcs[i].shortfall <= 0 ? 'Funded' : calcs[i].funded >= 90 ? 'On Track' : 'Behind',
           )),
           total(
             'Total', '', goals.reduce((a, g) => a + n(g.cost), 0), '', '', '', goals.reduce((a, g) => a + n(g.savings), 0),
             goals.reduce((a, g) => a + n(g.sip), 0), calcs.reduce((a, c) => a + c.target, 0), calcs.reduce((a, c) => a + c.corpus, 0),
-            '', '', '',
+            '', '', '', '',
           ),
         ]
-      : [row('No goals added', '', '', '', '', '', '', '', '', '', '', '', '')],
+      : [row('No goals added', '', '', '', '', '', '', '', '', '', '', '', '', '')],
   }];
 
   // ---- Retirement
@@ -213,6 +231,7 @@ export function buildReport(s) {
       title: 'Result',
       cols: [col('Item'), col('Amount', 'inr')],
       rows: [
+        row('Years to retirement', { v: r.yearsTo, fmt: 'num' }),
         row(`Monthly expense at retirement (after ${r.yearsTo} yrs)`, r.expenseAtRetirement),
         row(`Corpus required (${r.yearsIn} yrs of retirement)`, r.required),
         row('Existing corpus grown to retirement', r.grown),
