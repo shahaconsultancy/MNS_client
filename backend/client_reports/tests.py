@@ -65,3 +65,45 @@ class ClientPlanTests(APITestCase):
     def test_bad_phone_rejected(self):
         info = dict(plan()['info'], phone='123')
         self.assertEqual(self.client.put(self.url, plan(info=info), format='json').status_code, 400)
+
+
+class ClientDeleteTests(APITestCase):
+    """Hard delete: the client row and every table of their plan are removed from the database."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(email='adv@x.com', password='pw')
+        self.client_row = Client.objects.create(advisor=self.user, full_name='Ajay Gaikwad', plan_name='Gaikwad Plan')
+        self.client.force_authenticate(self.user)
+        res = self.client.put(f'/api/clients/{self.client_row.id}/plan/', plan(), format='json')
+        self.assertEqual(res.status_code, 200, res.content)
+
+    def related_counts(self):
+        from . import models
+
+        names = ('ClientProfile', 'IncomeItem', 'ExpenseItem', 'InvestmentItem', 'AssetItem', 'LiabilityItem', 'InsuranceCover', 'FamilyMember', 'Goal', 'RetirementPlan')
+        return {name: getattr(models, name).objects.filter(client_id=self.client_row.id).count() for name in names}
+
+    def test_delete_removes_the_client_and_every_plan_row(self):
+        self.assertTrue(all(self.related_counts().values()), self.related_counts())  # the plan really has rows in every table
+        res = self.client.delete(f'/api/clients/{self.client_row.id}/')
+        self.assertEqual(res.status_code, 204)
+        self.assertFalse(Client.objects.filter(id=self.client_row.id).exists())
+        self.assertEqual(set(self.related_counts().values()), {0})
+        self.assertEqual(self.client.get('/api/clients/').json(), [])
+        self.assertEqual(self.client.get(f'/api/clients/{self.client_row.id}/plan/').status_code, 404)
+
+    def test_other_advisors_clients_are_untouched(self):
+        other = get_user_model().objects.create_user(email='other@x.com', password='pw')
+        theirs = Client.objects.create(advisor=other, full_name='Someone Else', plan_name='Else Plan')
+        self.assertEqual(self.client.delete(f'/api/clients/{theirs.id}/').status_code, 404)
+        self.assertTrue(Client.objects.filter(id=theirs.id).exists())
+
+    def test_deleting_again_or_an_unknown_client_is_404(self):
+        self.assertEqual(self.client.delete(f'/api/clients/{self.client_row.id}/').status_code, 204)
+        self.assertEqual(self.client.delete(f'/api/clients/{self.client_row.id}/').status_code, 404)
+        self.assertEqual(self.client.delete('/api/clients/999999/').status_code, 404)
+
+    def test_signed_out_users_cannot_delete(self):
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.delete(f'/api/clients/{self.client_row.id}/').status_code, 401)
+        self.assertTrue(Client.objects.filter(id=self.client_row.id).exists())
