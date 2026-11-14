@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Plus, Search, User, ArrowRight } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { Plus, Search, User, ArrowRight, Trash2 } from 'lucide-react';
 import NewClientModal from '../../components/clients/NewClientModal.jsx';
-import { getCachedClients, listClients } from '../../services/clientService.js';
+import { deleteClient, getCachedClients, listClients } from '../../services/clientService.js';
+import { alertSuccess, confirmDeleteClient } from '../../services/alerts.js';
 import './ClientReportsPage.css';
 
 const FILTERS = [
@@ -48,6 +49,13 @@ export default function ClientReportsPage() {
   const [loadError, setLoadError] = useState('');
   const [showModal, setShowModal] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
+  // Set by the plan page after a successful Save. Cleared once shown, so a refresh does not show it again.
+  useEffect(() => {
+    if (!location.state?.saved) return;
+    navigate(location.pathname, { replace: true, state: null });
+    alertSuccess('Your data saved successfully', location.state.clientName ? `${location.state.clientName}'s plan has been updated.` : '');
+  }, [location.state, location.pathname, navigate]);
 
   useEffect(() => {
     listClients()
@@ -57,9 +65,16 @@ export default function ClientReportsPage() {
   }, []);
 
   const closeModal = useCallback(() => setShowModal(false), []);
+  const askDelete = async (card) => {
+    const deleted = await confirmDeleteClient(card.name, () => deleteClient(card.id));
+    if (!deleted) return;
+    setClients((prev) => prev.filter((c) => c.id !== card.id));
+    alertSuccess('Client deleted successfully', `${card.name} and all their financial information have been removed.`);
+  };
   const handleCreated = (client) => {
     setClients((prev) => [toCard(client), ...prev]);
     setShowModal(false);
+    alertSuccess('Client added successfully', `${client.title} ${client.full_name}'s plan has been created.`);
   };
 
   const visible = useMemo(() => {
@@ -145,7 +160,8 @@ export default function ClientReportsPage() {
         {visible.map((c) => {
           const st = status(c);
           return (
-            <article key={c.id} className="client">
+            // The whole card opens the report. The Open report button stays for keyboard and screen-reader users.
+            <article key={c.id} className="client client--link" onClick={() => navigate(`/client-reports/${c.id}`)}>
               <div className="client__top">
                 <span className="client__avatar">{c.initials}</span>
                 <div className="client__id">
@@ -153,6 +169,9 @@ export default function ClientReportsPage() {
                   <span>{c.fullName}</span>
                 </div>
                 <span className={`badge badge--${st}`}>{STATUS_LABEL[st]}</span>
+                <button type="button" className="client__delete" aria-label={`Delete ${c.name}`} title="Delete client" onClick={(e) => { e.stopPropagation(); askDelete(c); }}>
+                  <Trash2 size={15} />
+                </button>
               </div>
 
               <div className="client__figures">
@@ -169,7 +188,7 @@ export default function ClientReportsPage() {
               </div>
               <p className="client__advisor">Advisor: {c.advisor}</p>
 
-              <button type="button" className="client__open" onClick={() => navigate(`/client-reports/${c.id}`)}>
+              <button type="button" className="client__open" onClick={(e) => { e.stopPropagation(); navigate(`/client-reports/${c.id}`); }}>
                 Open report <ArrowRight size={14} />
               </button>
             </article>

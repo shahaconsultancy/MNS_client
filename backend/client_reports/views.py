@@ -17,6 +17,16 @@ class ClientListCreateView(generics.ListCreateAPIView):
         serializer.save(advisor=self.request.user)
 
 
+class ClientDetailView(generics.DestroyAPIView):
+    """DELETE permanently removes a client and, through the database's cascade, every row of their plan.
+
+    Only the advisor who owns the client can delete it; anyone else gets 404, as if it did not exist.
+    """
+
+    def get_queryset(self):
+        return Client.objects.filter(advisor=self.request.user)
+
+
 class ClientPlanView(APIView):
     """GET loads a client's saved plan; PUT saves all plan tabs into their tables."""
 

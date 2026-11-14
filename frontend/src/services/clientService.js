@@ -55,6 +55,15 @@ export const createClient = async (payload) => {
   return c;
 };
 
+// Permanently deletes the client and their whole plan on the server, then forgets every cached copy.
+export const deleteClient = async (id) => {
+  await authed(`/clients/${id}/`, { method: 'DELETE' });
+  clientCache.delete(String(id));
+  planCache.delete(String(id));
+  const list = readList();
+  if (list) writeList(list.filter((c) => String(c.id) !== String(id)));
+};
+
 export const getPlan = async (id) => {
   const data = await authed(`/clients/${id}/plan/`);
   planCache.set(String(id), data);

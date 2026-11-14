@@ -166,6 +166,10 @@
   box-shadow: 0 8px 24px rgba(11, 31, 61, 0.1);
 }
 
+.client--link {
+  cursor: pointer;
+}
+
 .client__top {
   display: flex;
   align-items: center;
@@ -220,6 +224,26 @@
   font-size: 11px;
   font-weight: 600;
   white-space: nowrap;
+}
+
+.client__delete {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #efe7d4;
+  border-radius: 8px;
+  background: #fff;
+  color: var(--color-gray);
+  cursor: pointer;
+}
+
+.client__delete:hover,
+.client__delete:focus-visible {
+  border-color: #f3c1bc;
+  background: #fde4e2;
+  color: var(--color-error);
 }
 
 .badge--surplus {
@@ -333,3 +357,4 @@
 }
 .reports__state { margin: 24px 0; padding: 28px; border: 1px dashed #e4dcc8; border-radius: 14px; text-align: center; color: var(--color-gray); }
 .reports__state--error { color: var(--color-error); }
+

@@ -1,0 +1,13 @@
+/* SweetAlert2 in the site's style. */
+.mns-swal { border-radius: 18px; padding: 24px 24px 22px; font-family: var(--font-main); }
+.mns-swal__title { font-size: 21px; color: var(--color-black); }
+.mns-swal__text { font-size: 14px; line-height: 1.55; color: var(--color-gray); text-align: center; }
+.mns-swal__text p { margin: 0 0 10px; }
+.mns-swal__client { display: inline-block; padding: 4px 10px; border-radius: 8px; background: #f3efe3; font-weight: 600; color: var(--color-black); }
+.mns-swal__warn { font-weight: 600; color: var(--color-error); }
+.mns-swal__ask { font-weight: 600; color: var(--color-black); }
+.mns-swal__btn { height: 42px; margin: 0 6px; padding: 0 20px; border: 0; border-radius: var(--radius); background: var(--color-blue); color: #fff; font-family: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+.mns-swal__btn--danger { background: var(--color-error); }
+.mns-swal__btn--cancel { border: 1.5px solid #e4dcc8; background: #fff; color: var(--color-black); }
+.mns-swal__btn:focus-visible { outline: 3px solid rgba(194, 144, 53, 0.45); outline-offset: 2px; }
+.mns-swal .swal2-timer-progress-bar { background: var(--color-yellow); }

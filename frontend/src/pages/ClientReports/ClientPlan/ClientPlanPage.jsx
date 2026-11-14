@@ -4,6 +4,7 @@ import { ArrowLeft, ChevronDown, Download, FileSpreadsheet, FileText, Save, Uplo
 import { exportExcel, exportPdf } from './exportPlan.js';
 import { readPlanFile } from './importPlan.js';
 import { getCachedClient, getCachedPlan, getPlan, savePlan } from '../../../services/clientService.js';
+import { alertError } from '../../../services/alerts.js';
 import { fromPlan, toPayload } from './planApi.js';
 import { TABS } from './tabs.js';
 import { inr, pct } from './format.js';
@@ -144,10 +145,14 @@ export default function ClientPlanPage() {
     setSaving(true);
     setSaveError('');
     try {
-      await savePlan(id, toPayload(planState));
+      const result = await savePlan(id, toPayload(planState));
       setSaved(snapshot);
+      // Saved: back to the client cards, which already show the new figures. A failed save stays here.
+      const c = result?.client;
+      navigate('/client-reports', { state: { saved: true, clientName: c ? `${c.title} ${c.full_name}` : '' } });
     } catch (err) {
       setSaveError(err.message);
+      alertError('Your data could not be saved', err.message || 'Please try again.');
     } finally {
       setSaving(false);
     }
