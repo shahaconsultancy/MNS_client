@@ -391,15 +391,18 @@ td.fa-table__fund em {
 
 .fa-overlap { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 14px; align-items: start; }
 .fa-overlap > * { min-width: 0; }
+/* Many funds: the matrix takes the full width and the pair details sit below, so the two never overlap. */
+.fa-overlap--stacked { grid-template-columns: minmax(0, 1fr); }
 .fa-pairs { margin-top: 14px; }
-.fa-pair__list { max-height: 340px; overflow-y: auto; }
+.fa-pair__list { max-height: 420px; overflow-y: auto; }
 .fa-pair__total small { display: block; margin-top: 3px; font-size: 10px; color: var(--color-gray); }
 .fa-pairs__body, .fa-pairs__names, .fa-pairs__stocks { display: flex; }
 .fa-pairs__body { flex-direction: column; }
 
 .fa-matrix__scroll { overflow-x: auto; }
 
-.fa-matrix__grid { display: grid; gap: 2px; min-width: max-content; font-size: 11px; }
+/* min-content: fund names wrap so the matrix fits its card, and it scrolls only when the 76px columns do not fit. */
+.fa-matrix__grid { display: grid; gap: 2px; min-width: min-content; font-size: 11px; }
 
 .fa-matrix__col { display: flex; flex-direction: column; align-items: center; gap: 4px; padding-bottom: 6px; color: var(--color-gray); text-align: center; }
 .fa-matrix__row { display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding-right: 8px; font-weight: 600; text-align: right; }
@@ -438,22 +441,23 @@ td.fa-table__fund em {
 .fa-pair__total strong { display: block; font-size: 24px; font-weight: 700; }
 .fa-pair__total span { font-size: 9px; font-weight: 700; letter-spacing: 1.2px; color: #6b6b6b; }
 
-.fa-pair__columns { display: flex; justify-content: space-between; padding: 12px 0 8px; font-size: 9px; font-weight: 700; letter-spacing: 1px; color: #6b6b6b; }
+.fa-pair__columns { display: flex; justify-content: space-between; padding: 12px 0 8px; font-size: 13px; font-weight: 700; letter-spacing: 1px; color: #6b6b6b; }
 .fa-pair__none { margin: 6px 0; font-size: 13px; color: var(--color-gray); }
 .fa-pair__split { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 12px 0 0; }
 .fa-pair__split div { padding: 8px 10px; border: 1px solid var(--fa-border); border-radius: 6px; }
 .fa-pair__split dt { font-size: 9px; font-weight: 700; letter-spacing: 1px; color: #6b6b6b; }
 .fa-pair__split dd { margin: 3px 0 1px; font-size: 14px; font-weight: 700; }
 .fa-pair__split small { font-size: 10px; color: var(--color-gray); }
-.fa-pair__meta { display: block; margin-top: 2px; font-size: 10px; color: var(--color-gray); }
-.fa-pair__units { margin: 10px 0 0; font-size: 11px; line-height: 1.5; color: var(--color-gray); }
+.fa-pair__meta { display: block; margin-top: 3px; font-size: 14px; color: var(--color-gray); }
+.fa-pair__units { margin: 10px 0 0; font-size: 15px; line-height: 1.55; color: var(--color-gray); }
 
-.fa-pair__row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 9px 0; border-top: 1px solid var(--fa-border); font-size: 12px; color: #4a5266; }
+/* Common holdings: sized for clients to read comfortably (stock 16px, details and weights 14px). */
+.fa-pair__row { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 12px 0; border-top: 1px solid var(--fa-border); font-size: 16px; color: #2f3747; }
 
-.fa-pair__bars { flex-shrink: 0; width: 86px; }
-.fa-pair__bars span { display: flex; align-items: center; gap: 5px; font-size: 9px; color: var(--color-gray); }
-.fa-pair__bars span + span { margin-top: 3px; }
-.fa-pair__bars i { height: 3px; border-radius: 2px; }
+.fa-pair__bars { flex-shrink: 0; width: 140px; }
+.fa-pair__bars span { display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 600; color: #4a5266; }
+.fa-pair__bars span + span { margin-top: 4px; }
+.fa-pair__bars i { height: 4px; border-radius: 2px; }
 
 .fa-pairs__row {
   display: flex;
@@ -642,3 +646,7 @@ td.fa-table__fund em {
 /* The offscreen copy drawn into the saved PDF: every tab, laid out at a fixed desktop width. */
 .fa-export { position: fixed; left: -10000px; top: 0; width: 1100px; padding: 24px; background: #fff; pointer-events: none; }
 .fa-export > * + * { margin-top: 16px; }
+/* In the PDF the matrix is drawn unclipped (every column), so it always gets the full width with the
+   pair details below; columns may narrow so that many funds still fit the page. */
+.fa-export .fa-overlap { grid-template-columns: minmax(0, 1fr); }
+.fa-export .fa-matrix__grid { --fa-matrix-col: 48px; min-width: 0; }

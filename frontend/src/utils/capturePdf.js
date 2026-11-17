@@ -1,7 +1,7 @@
 // Saves part of the page as a PDF that looks like the page itself, without the print dialog.
 // The element is drawn with html2canvas (already installed as jsPDF's optional dependency), cut into A4 pages
-// without splitting a card in two where it can be avoided, and downloaded. Both libraries load on first use.
-// The text in the PDF is part of a picture, so it cannot be selected or searched.
+// without splitting a card where it can be avoided and never through a row or a line of text, and downloaded.
+// Both libraries load on first use. The text in the PDF is part of a picture, so it cannot be selected or searched.
 
 const PAGE_W = 210; // A4 portrait, mm
 const PAGE_H = 297;
@@ -10,29 +10,57 @@ const MARGIN_TOP = 8;
 const MARGIN_BOTTOM = 12; // room for the page number
 const MAX_CANVAS_PX = 14000; // browsers refuse canvases much taller than this
 
-// Elements that sit inside another matching element are dropped: only the outer card has to stay in one piece.
-function outerRanges(elements, originTop, scale) {
-  const rects = elements.map((el) => {
-    const r = el.getBoundingClientRect();
-    return { el, top: (r.top - originTop) * scale, bottom: (r.bottom - originTop) * scale };
-  });
-  return rects
-    .filter((a) => !rects.some((b) => b !== a && b.el.contains(a.el)))
+// Whatever must never be cut in half, wherever it appears: rows, list and table rows, pictures, and every element
+// that holds text directly (a line or paragraph of text). New sections are covered without being listed here.
+const UNBREAKABLE = 'tr, li, img, svg, canvas, [class*="__row"], [class*="__cell"], [class*="__item"], [class*="__stat"]';
+// Smallest share of a page a slice keeps when its end moves up, so a page is never left almost empty.
+const MIN_FILL_KEEP = 0.75; // a card moves whole to the next page only if this page stays three-quarters full;
+// otherwise it continues on the next page, split between rows (never through a row or a line of text)
+const MIN_FILL_ATOM = 0.5; // for not cutting a row or a line of text: the end moves up at most half a page
+// Only short elements count as rows or lines of text. Taller ones are sections, which may be split between rows.
+const MAX_ATOM_SHARE = 1 / 3;
+// Neighbouring rows meet at fractional pixels. Within this many pixels an edge counts as touching, not cut,
+// so a moved page end never slips into the row above and drags the break upward row after row.
+const EDGE_PX = 2;
+const cuts = (r, y) => r.top < y - EDGE_PX && r.bottom > y + EDGE_PX;
+
+function rangesOf(elements, originTop, scale) {
+  return elements
+    .map((el) => {
+      const r = el.getBoundingClientRect();
+      return { top: (r.top - originTop) * scale, bottom: (r.bottom - originTop) * scale };
+    })
+    .filter((r) => r.bottom > r.top)
     .sort((a, b) => a.top - b.top);
 }
 
+function holdsText(el) {
+  for (const node of el.childNodes) {
+    if (node.nodeType === 3 && node.textContent.trim()) return true;
+  }
+  return false;
+}
+
 /**
- * Pages as [startPx, endPx] slices of a canvas `height` px tall. A slice moves its end up to the top of the block it
- * would cut through, when that block fits on one page and the move still leaves the slice at least a fifth full.
+ * Pages as [startPx, endPx] slices of a canvas `height` px tall.
+ *  1. keep: blocks (cards) are kept whole when they fit on one page. Of the blocks a page end would cut, the
+ *     outermost one that fits moves the end up to its top, if the page stays at least three-quarters full.
+ *  2. atoms: rows and lines of text are never cut. While the end falls inside one, it moves up to the top of
+ *     the highest one it cuts. Only a single atom taller than a page (a huge picture) can still be cut.
  */
-export function pageSlices(height, pageHeight, ranges) {
+export function pageSlices(height, pageHeight, keep = [], atoms = []) {
   const slices = [];
   let start = 0;
   while (start < height) {
     let end = Math.min(start + pageHeight, height);
     if (end < height) {
-      const cut = ranges.find((r) => r.top < end && r.bottom > end);
-      if (cut && cut.bottom - cut.top <= pageHeight && cut.top - start >= pageHeight * 0.2) end = Math.floor(cut.top);
+      const fits = keep.filter((r) => cuts(r, end) && r.bottom - r.top <= pageHeight && r.top - start >= pageHeight * MIN_FILL_KEEP);
+      if (fits.length) end = Math.floor(Math.min(...fits.map((r) => r.top)));
+      for (let guard = 0; guard < 50; guard += 1) {
+        const cut = atoms.filter((r) => cuts(r, end) && r.bottom - r.top <= pageHeight * MAX_ATOM_SHARE && r.top - start >= pageHeight * MIN_FILL_ATOM);
+        if (!cut.length) break;
+        end = Math.floor(Math.min(...cut.map((r) => r.top)));
+      }
     }
     slices.push([start, end]);
     start = end;
@@ -48,7 +76,8 @@ export function pageSlices(height, pageHeight, ranges) {
 export async function buildPdfFromElement(element, { hide = [], unclip = [], keepTogether = [], windowWidth = 1100, footer } = {}) {
   const [{ default: html2canvas }, { jsPDF }] = await Promise.all([import('html2canvas'), import('jspdf')]);
   const scale = Math.max(1, Math.min(2, MAX_CANVAS_PX / Math.max(element.scrollHeight, 1)));
-  let ranges = [];
+  let keep = [];
+  let atoms = [];
 
   const canvas = await html2canvas(element, {
     scale,
@@ -68,7 +97,9 @@ export async function buildPdfFromElement(element, { hide = [], unclip = [], kee
       // An element parked offscreen is measured where it sits, so bring the copy back into the page.
       ['position', 'left', 'top'].forEach((property) => clonedElement.style.setProperty(property, property === 'position' ? 'static' : 'auto', 'important'));
       const origin = clonedElement.getBoundingClientRect().top;
-      ranges = outerRanges([...clonedElement.querySelectorAll(keepTogether.join(',') || ':scope > *')], origin, scale);
+      keep = rangesOf([...clonedElement.querySelectorAll(keepTogether.join(',') || ':scope > *')], origin, scale);
+      const visible = [...clonedElement.querySelectorAll('*')].filter((el) => el.getClientRects().length);
+      atoms = rangesOf(visible.filter((el) => el.matches(UNBREAKABLE) || holdsText(el)), origin, scale);
     },
   });
 
@@ -76,7 +107,7 @@ export async function buildPdfFromElement(element, { hide = [], unclip = [], kee
   const contentW = PAGE_W - MARGIN_X * 2;
   const mmPerPx = contentW / canvas.width;
   const pageHeightPx = Math.floor((PAGE_H - MARGIN_TOP - MARGIN_BOTTOM) / mmPerPx);
-  const slices = pageSlices(canvas.height, pageHeightPx, ranges);
+  const slices = pageSlices(canvas.height, pageHeightPx, keep, atoms);
 
   slices.forEach(([start, end], index) => {
     if (index) doc.addPage();
