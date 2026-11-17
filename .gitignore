@@ -1,0 +1,5 @@
+# Dependencies are installed inside frontend/ and backend/, never at the repo root.
+# An npm install run here by mistake would otherwise be picked up by git.
+/node_modules/
+/package.json
+/package-lock.json

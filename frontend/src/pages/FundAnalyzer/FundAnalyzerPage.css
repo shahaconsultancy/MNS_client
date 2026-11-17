@@ -638,3 +638,7 @@ td.fa-table__fund em {
   .fa-card, .fa-stat { box-shadow: none; break-inside: avoid; }
   .fa-stat--dark, .fa-notice, .fa-matrix__cell { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }
+
+/* The offscreen copy drawn into the saved PDF: every tab, laid out at a fixed desktop width. */
+.fa-export { position: fixed; left: -10000px; top: 0; width: 1100px; padding: 24px; background: #fff; pointer-events: none; }
+.fa-export > * + * { margin-top: 16px; }

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import { Blend, Download, List, PieChart } from 'lucide-react';
 import FundPicker from './components/FundPicker.jsx';
 import SummaryCards from './components/SummaryCards.jsx';
@@ -8,8 +9,10 @@ import FundamentalsTab from './components/FundamentalsTab.jsx';
 import { fundColor } from './fundData.js';
 import { compareFunds, getFundamentals, getHoldingsOverlapWithProgress } from '../../services/fundAnalyzerService.js';
 import { getUserEmail } from '../../services/authService.js';
-import { exportFundReport } from './exportFundReport.js';
+import { savePageAsPdf } from '../../utils/capturePdf.js';
 import './FundAnalyzerPage.css';
+
+const DISCLAIMER = 'Mutual fund investments are subject to market risks; read all scheme-related documents carefully. Past performance may or may not be sustained in future.';
 
 const TABS = [
   { key: 'compare', label: 'Compare', icon: List, Component: CompareTab },
@@ -44,7 +47,6 @@ export default function FundAnalyzerPage() {
   const [saved] = useState(readSaved);
   const [selectedFunds, setSelectedFunds] = useState(saved.funds);
   const [analyzed, setAnalyzed] = useState(saved.analyzed);
-  const [saving, setSaving] = useState(false);
   const [funds, setFunds] = useState([]);
   const [activeTab, setActiveTab] = useState('compare');
   const [loading, setLoading] = useState(false);
@@ -133,13 +135,30 @@ export default function FundAnalyzerPage() {
     // Runs once, on the first render only.
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Save report: draws the whole analysis (Compare, Overlap and Fundamentals, whichever tab is open) as it looks on screen
+  // and downloads it as a PDF, with no print dialog. The drawing is done on an offscreen copy, so the page does not change.
+  // If it cannot be drawn, the browser's print dialog opens instead.
+  const exportRef = useRef(null);
+  const [exporting, setExporting] = useState(false);
+  const [saving, setSaving] = useState(false);
   const saveReport = async () => {
     setSaving(true);
+    setError('');
     try {
-      await exportFundReport({ funds, overlap, overlapLoading, fundMetadata, fundamentalsLoading, source, asOfDate, riskFreeRate });
+      flushSync(() => setExporting(true));
+      await new Promise((resolve) => requestAnimationFrame(resolve)); // let the copy lay out
+      const stamp = new Date().toISOString().slice(0, 10);
+      await savePageAsPdf(exportRef.current, `Fund Analyzer Report - ${stamp}.pdf`, {
+        hide: ['form.fa-notice', '.fa-fund__foot button', '.fa-detail__more'],
+        unclip: ['.fa-table-wrap', '.fa-matrix__scroll', '.fa-pair__list', '.fa-fund__holdings--all'],
+        keepTogether: ['.fa-card', '.fa-stats', '.fa-notice', '.fa-fund', '.fa-detail', '.fa__empty'],
+        footer: (page, pages) => `Fund Analyzer Report  |  ${stamp}  |  Page ${page} of ${pages}`,
+      });
     } catch (err) {
-      setError(`The report could not be saved: ${err.message || 'unknown error'}`);
+      console.error('Report could not be drawn, opening the print dialog instead', err);
+      window.print();
     } finally {
+      setExporting(false);
       setSaving(false);
     }
   };
@@ -147,17 +166,25 @@ export default function FundAnalyzerPage() {
   useEffect(() => { const handleKey = (event) => { if (event.key === '/' && !['INPUT', 'TEXTAREA'].includes(event.target.tagName)) { event.preventDefault(); document.querySelector('.fa-search__box input')?.focus(); } }; window.addEventListener('keydown', handleKey); return () => window.removeEventListener('keydown', handleKey); }, []);
 
   const { Component } = TABS.find((tab) => tab.key === activeTab);
-  const displayedFunds = activeTab === 'fundamentals'
+  // The Fundamentals tab shows each fund together with its published metadata.
+  const fundsFor = (key) => (key === 'fundamentals'
     ? funds.map((fund) => {
       const metadata = fundMetadata[fund.scheme_code] || {};
       return { ...fund, ...metadata, ter: metadata.ter ?? fund.ter, ter_as_of: metadata.ter_as_of ?? fund.ter_as_of, metrics: fund.metrics ?? metadata.metrics };
     })
-    : funds;
+    : funds);
+  const displayedFunds = fundsFor(activeTab);
   return <div className="fa">
     <header className="fa__header"><div><p className="fa__eyebrow"><i /> LIVE {source}</p><h1>Fund Analyzer</h1><p className="fa__sub">Compare live AMFI NAV history, returns, risk, holdings overlap and published fund metadata for the schemes you select.</p></div><div className="fa__actions"><button type="button" className="fa__action" onClick={saveReport} disabled={!funds.length || saving} title={funds.length ? 'Save this analysis as a PDF' : 'Run Update analysis first'}><Download size={15} /> {saving ? 'Saving…' : 'Save report'}</button></div></header>
     <FundPicker selectedFunds={selectedFunds} onChange={setSelectedFunds} onClear={clearAll} onUpdate={() => load()} loading={loading} />
     {error && <p className="fa-notice" role="alert">{error}</p>}
     {!funds.length && !loading ? <p className="fa-card fa__empty">Select AMFI schemes and press Update analysis to load live figures.</p> : <>{funds.length > 0 && <><SummaryCards funds={funds} overlap={overlap} overlapLoading={overlapLoading} overlapStage={overlapStage} /><div className="fa__tabbar"><nav className="fa__tabs" role="tablist">{TABS.map(({ key, label, icon: Icon }) => <button key={key} type="button" role="tab" aria-selected={activeTab === key} className={`fa__tab${activeTab === key ? ' fa__tab--active' : ''}`} onClick={() => setActiveTab(key)}><Icon size={15} /> {label}</button>)}</nav></div><Component funds={displayedFunds} overlap={overlap} overlapLoading={overlapLoading} overlapStage={overlapStage} onHistoricalMonth={(month) => loadOverlap(funds.map((fund) => fund.scheme_code), month)} riskFreeRate={riskFreeRate} loading={fundamentalsLoading} error={fundamentalsError} /></>}</>}
-    <p className="fa__disclaimer">Mutual fund investments are subject to market risks; read all scheme-related documents carefully. Past performance may or may not be sustained in future.</p>
+    <p className="fa__disclaimer">{DISCLAIMER}</p>
+    {exporting && funds.length > 0 && <div className="fa-export" ref={exportRef} aria-hidden="true">
+      <header className="fa__header"><div><p className="fa__eyebrow"><i /> LIVE {source}</p><h1>Fund Analyzer</h1><p className="fa__sub">Compare live AMFI NAV history, returns, risk, holdings overlap and published fund metadata for the schemes you select.</p></div></header>
+      <SummaryCards funds={funds} overlap={overlap} overlapLoading={overlapLoading} overlapStage={overlapStage} />
+      {TABS.map(({ key, Component: TabComponent }) => <TabComponent key={key} funds={fundsFor(key)} overlap={overlap} overlapLoading={overlapLoading} overlapStage={overlapStage} riskFreeRate={riskFreeRate} loading={fundamentalsLoading} error={fundamentalsError} expandAll />)}
+      <p className="fa__disclaimer">{DISCLAIMER}</p>
+    </div>}
   </div>;
 }
