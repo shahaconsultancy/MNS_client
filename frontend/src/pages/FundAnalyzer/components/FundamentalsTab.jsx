@@ -169,13 +169,18 @@ function FundDetail({ fund, loading }) {
   </article>;
 }
 
-export default function FundamentalsTab({ funds, loading, error }) {
+// expandAll is used for the saved PDF: the fund cards, then every fund's full details one after another.
+export default function FundamentalsTab({ funds, loading, error, expandAll = false }) {
   const [openCode, setOpenCode] = useState(null);
   const openFund = funds.find((fund) => fund.scheme_code === openCode);
   return <>
     {error && <p className="fa-notice" role="alert"><Info size={14} /> <span>{error}</span></p>}
     <p className="fa-notice"><Info size={14} /> <span>Expense ratio and AUM are official AMFI disclosures. Holdings, sectors and allocation come from each AMC's monthly portfolio file.</span></p>
-    {openFund
+    {expandAll && <>
+      <div className="fa-funds">{funds.map((fund) => <FundCard key={fund.scheme_code} fund={fund} loading={loading} onOpen={() => {}} />)}</div>
+      {funds.map((fund) => <FundDetail key={fund.scheme_code} fund={fund} loading={loading} />)}
+    </>}
+    {!expandAll && openFund
       ? <>
         <button type="button" className="fa__action fa-detail__back" onClick={() => setOpenCode(null)}><ChevronLeft size={14} /> All funds</button>
         <div className="fa-detail__layout">
@@ -187,6 +192,7 @@ export default function FundamentalsTab({ funds, loading, error }) {
           <FundDetail key={openFund.scheme_code} fund={openFund} loading={loading} />
         </div>
       </>
-      : <div className="fa-funds">{funds.map((fund) => <FundCard key={fund.scheme_code} fund={fund} loading={loading} onOpen={setOpenCode} />)}</div>}
+      : null}
+    {!expandAll && !openFund && <div className="fa-funds">{funds.map((fund) => <FundCard key={fund.scheme_code} fund={fund} loading={loading} onOpen={setOpenCode} />)}</div>}
   </>;
 }
