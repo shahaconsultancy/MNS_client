@@ -4,6 +4,8 @@ import { Info } from 'lucide-react';
 const SCALE_MAX = 60;
 const TOP_PAIRS = 5;
 const STOCK_CHIPS = 4;
+// More funds than this and the matrix is laid out full width, with the pair details below it.
+const STACK_AFTER_FUNDS = 5;
 
 const shortName = (name) => name.split(' - ')[0].replace(/ Fund$/i, '');
 const pairKey = (pair) => `${pair.left.scheme_code}-${pair.right.scheme_code}`;
@@ -26,7 +28,7 @@ function Matrix({ funds, pairs, selected, onSelect }) {
   return <section className="fa-card fa-matrix">
     <div className="fa-section-head fa-section-head--flush"><h2>Overlap matrix</h2><p>% of portfolio weight the two funds hold in common. Click any cell for details.</p></div>
     <div className="fa-matrix__scroll">
-      <div className="fa-matrix__grid" style={{ gridTemplateColumns: `130px repeat(${funds.length}, minmax(76px, 1fr))` }}>
+      <div className="fa-matrix__grid" style={{ gridTemplateColumns: `130px repeat(${funds.length}, minmax(var(--fa-matrix-col, 76px), 1fr))` }}>
         <span />
         {funds.map((fund) => <span key={fund.scheme_code} className="fa-matrix__col" title={fund.scheme_name}><i style={{ background: fund.color }} />{shortName(fund.scheme_name)}</span>)}
         {funds.map((rowFund) => [
@@ -51,7 +53,7 @@ function PairDetail({ pair, colorOf }) {
   const isFof = pair.overlap_type === 'DIRECT_FOF';
   const largest = Math.max(1, ...stocks.flatMap((stock) => [stock.left_weight, stock.right_weight]));
   const bar = (weight, code) => <span>
-    <i style={{ width: `${Math.max(3, (weight / largest) * 46)}px`, background: colorOf(code) }} />{weight.toFixed(2)}%
+    <i style={{ width: `${Math.max(3, (weight / largest) * 60)}px`, background: colorOf(code) }} />{weight.toFixed(2)}%
   </span>;
   return <section className="fa-card fa-pair">
     <div className="fa-pair__head">
@@ -193,7 +195,8 @@ export default function OverlapTab({ funds, overlap, overlapLoading, overlapStag
     </p>
     <MonthNotice overlap={overlap} pairs={pairs} funds={funds} />
     <HistoricalPicker overlap={overlap} onSelect={onHistoricalMonth} />
-    <div className="fa-overlap">
+    {/* Beyond five funds the matrix needs the full width, so the pair details go below it. */}
+    <div className={`fa-overlap${funds.length > STACK_AFTER_FUNDS ? ' fa-overlap--stacked' : ''}`}>
       <Matrix funds={funds} pairs={pairs} selected={selected} onSelect={setActiveKey} />
       <PairDetail pair={selected} colorOf={colorOf} />
     </div>
