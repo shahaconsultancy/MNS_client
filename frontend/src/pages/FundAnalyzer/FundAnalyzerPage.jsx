@@ -7,7 +7,7 @@ import CompareTab from './components/CompareTab.jsx';
 import OverlapTab from './components/OverlapTab.jsx';
 import FundamentalsTab from './components/FundamentalsTab.jsx';
 import { fundColor } from './fundData.js';
-import { compareFunds, getFundamentals, getHoldingsOverlapWithProgress } from '../../services/fundAnalyzerService.js';
+import { compareFundsInBatches, getFundamentalsInBatches, getHoldingsOverlapWithProgress } from '../../services/fundAnalyzerService.js';
 import { getUserEmail } from '../../services/authService.js';
 import { savePageAsPdf } from '../../utils/capturePdf.js';
 import './FundAnalyzerPage.css';
@@ -84,7 +84,8 @@ export default function FundAnalyzerPage() {
     const schemeCodes = fundsToLoad.map((fund) => fund.scheme_code);
     loadOverlap(schemeCodes);
     try {
-      const payload = await compareFunds(schemeCodes);
+      // In small groups, so a large selection never hits the server's time limit (see compareFundsInBatches).
+      const payload = await compareFundsInBatches(fundsToLoad);
       if (!current()) return;
       setFunds((payload.funds || []).map((fund, index) => ({ ...fund, color: fundColor(index) })));
       setSource(payload.source || 'AMFI'); setAsOfDate(payload.asOfDate || null); setRiskFreeRate(payload.summary?.riskFreeRate ?? 0.065);
@@ -110,7 +111,8 @@ export default function FundAnalyzerPage() {
     let cancelled = false;
     setFundamentalsLoading(true);
     setFundamentalsError('');
-    getFundamentals(missing.map((fund) => fund.scheme_code))
+    // A fund whose group failed is stored as unavailable, so it is not asked for again in a loop.
+    getFundamentalsInBatches(missing.map((fund) => fund.scheme_code))
       .then((payload) => {
         if (cancelled) return;
         setFundMetadata((current) => ({
@@ -149,8 +151,8 @@ export default function FundAnalyzerPage() {
       await new Promise((resolve) => requestAnimationFrame(resolve)); // let the copy lay out
       const stamp = new Date().toISOString().slice(0, 10);
       await savePageAsPdf(exportRef.current, `Fund Analyzer Report - ${stamp}.pdf`, {
-        hide: ['form.fa-notice', '.fa-fund__foot button', '.fa-detail__more'],
-        unclip: ['.fa-table-wrap', '.fa-matrix__scroll', '.fa-pair__list', '.fa-fund__holdings--all'],
+        hide: ['form.fa-notice', '.fa-fund__foot button', '.fa-detail__more', '.fa-notice__more'],
+        unclip: ['.fa-notice__body', '.fa-table-wrap', '.fa-matrix__scroll', '.fa-pair__list', '.fa-fund__holdings--all'],
         keepTogether: ['.fa-card', '.fa-stats', '.fa-notice', '.fa-fund', '.fa-detail', '.fa__empty'],
         footer: (page, pages) => `Fund Analyzer Report  |  ${stamp}  |  Page ${page} of ${pages}`,
       });

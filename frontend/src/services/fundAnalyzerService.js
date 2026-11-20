@@ -15,6 +15,80 @@ export async function getFundamentals(schemeCodes) {
   return data;
 }
 
+// Large selections are loaded in small groups, so no single request runs long enough to hit a hosting time limit
+// (Vercel stops a function after its maximum duration). Every fund is calculated on its own, so the combined result
+// is the same as one request for all of them. A group that fails is asked again once; if it still fails, only its
+// funds are shown as unavailable and every other fund is shown normally.
+const BATCH_SIZE = 6;
+const PARALLEL_BATCHES = 2;
+export const NAV_UNAVAILABLE_NOTE = 'NAV history could not be loaded right now, so returns and risk are not shown. Press Update analysis again in a moment.';
+
+async function runInBatches(items, run) {
+  const batches = [];
+  for (let i = 0; i < items.length; i += BATCH_SIZE) batches.push(items.slice(i, i + BATCH_SIZE));
+  const results = new Array(batches.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < batches.length) {
+      const index = next;
+      next += 1;
+      try {
+        results[index] = { value: await run(batches[index]) };
+      } catch {
+        try {
+          results[index] = { value: await run(batches[index]) };
+        } catch (error) {
+          results[index] = { error };
+        }
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(PARALLEL_BATCHES, batches.length) }, worker));
+  return { batches, results };
+}
+
+// selectedFunds: the picked funds ({ scheme_code, scheme_name, amc, ... }), used to name a fund whose group failed.
+export async function compareFundsInBatches(selectedFunds) {
+  const codes = selectedFunds.map((fund) => fund.scheme_code);
+  const { results } = await runInBatches(codes, (batch) => compareFunds(batch));
+  const loaded = results.filter((result) => result.value);
+  if (!loaded.length) throw results[0].error;
+  const byCode = {};
+  loaded.forEach(({ value }) => (value.funds || []).forEach((fund) => { byCode[fund.scheme_code] = fund; }));
+  const picked = Object.fromEntries(selectedFunds.map((fund) => [fund.scheme_code, fund]));
+  const funds = codes.map((code) => byCode[code] || {
+    scheme_code: code,
+    scheme_name: picked[code]?.scheme_name || picked[code]?.display_name || code,
+    amc: picked[code]?.amc || null,
+    category: picked[code]?.category || null,
+    plan: picked[code]?.plan || null,
+    option: picked[code]?.option || null,
+    source: 'AMFI',
+    history: [],
+    metrics: null,
+    metrics_unavailable: NAV_UNAVAILABLE_NOTE,
+  });
+  const dates = loaded.map(({ value }) => value.asOfDate).filter(Boolean).sort();
+  return {
+    funds,
+    source: loaded.some(({ value }) => value.source === 'MFAPI (backup)') ? 'MFAPI (backup)' : (loaded[0].value.source || 'AMFI'),
+    asOfDate: dates.length ? dates[dates.length - 1] : null,
+    summary: loaded[0].value.summary || null,
+  };
+}
+
+// Fundamentals for many funds, in groups. A fund whose group failed comes back as { scheme_code, unavailable: true }.
+export async function getFundamentalsInBatches(schemeCodes) {
+  const { batches, results } = await runInBatches(schemeCodes, (batch) => getFundamentals(batch));
+  if (results.every((result) => result.error)) throw results[0].error;
+  const funds = [];
+  results.forEach((result, index) => {
+    if (result.value) funds.push(...(result.value.funds || []));
+    else funds.push(...batches[index].map((code) => ({ scheme_code: code, unavailable: true })));
+  });
+  return { funds };
+}
+
 // The single-request overlap does all its work before it answers, so it may take a while on a first
 // retrieval. Past this the browser stops waiting; the server's own limit may end it sooner (HTTP 504).
 const SYNC_OVERLAP_TIMEOUT_MS = 5 * 60 * 1000;
