@@ -115,6 +115,11 @@ FUND_ANALYZER_CHARLIE_ALPHA_MAX_REQUESTS = max(1, int(os.getenv('FUND_ANALYZER_C
 FUND_ANALYZER_HOLDINGS_CACHE_DIR = os.getenv('FUND_ANALYZER_HOLDINGS_CACHE_DIR') or str(
     Path(tempfile.gettempdir()) / 'mns-portfolio-cache' if os.getenv('VERCEL') else BASE_DIR / 'portfolio_cache'
 )
+# A copy of every holdings, status and source-health file above, kept in Redis. On Vercel the folder is
+# per-instance and temporary, so without it each new instance downloads and parses the AMC files again;
+# with it, a file missing from the folder is restored from Redis. On by default when REDIS_URL is set.
+_shared_holdings = os.getenv('FUND_ANALYZER_HOLDINGS_SHARED_CACHE', '').strip().lower()
+FUND_ANALYZER_HOLDINGS_SHARED_CACHE = _shared_holdings in ('1', 'true', 'yes', 'on') if _shared_holdings else bool(os.getenv('REDIS_URL'))
 # Ask the monthly-portfolio page AMFI's directory lists for an AMC first, then the AMC's own route.
 # Off: the AMC's own route only.
 FUND_ANALYZER_AMFI_FALLBACK_ENABLED = os.getenv('FUND_ANALYZER_AMFI_FALLBACK_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes', 'on')
@@ -127,6 +132,8 @@ FUND_ANALYZER_OVERLAP_JOBS_ENABLED = _overlap_jobs in ('1', 'true', 'yes', 'on')
 if 'test' in sys.argv:
     # Tests must never touch the real cache.
     FUND_ANALYZER_HOLDINGS_CACHE_DIR = tempfile.mkdtemp(prefix='mns-test-portfolio-cache-')
+    # Nor the Redis copy of it. Tests of the copy switch it on with a local in-memory cache.
+    FUND_ANALYZER_HOLDINGS_SHARED_CACHE = False
     # Nor reach AMFI's directory through mocked AMC sources. Tests of the fallback switch it on.
     FUND_ANALYZER_AMFI_FALLBACK_ENABLED = False
     # Nor the Charlie Alpha API, whatever a local .env says. Tests of the backup switch it on with mocks.

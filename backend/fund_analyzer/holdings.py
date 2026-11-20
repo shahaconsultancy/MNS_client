@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -627,6 +628,45 @@ def _download_portfolio_file(amc_key: str, url: str, *, guessed: bool = False) -
     return payload
 
 
+# A file name guessed from an AMC's published pattern (HDFC's listing page answers 403) that is not there.
+# Remembered in the shared cache, so each request does not ask again for every missing guess (HDFC: six
+# requests and their polite pauses, about 5 s a comparison). A month published later is found within this.
+GUESS_MISS_SECONDS = 6 * 3600
+GUESS_MISS_HTTP = (403, 404, 410)
+
+
+def _guess_miss_key(url: str) -> str:
+    return 'fund-analyzer:portfolio:guess-miss:' + hashlib.sha256(url.encode('utf-8')).hexdigest()
+
+
+def _remembered_miss(url: str) -> ProviderError | None:
+    try:
+        miss = cache.get(_guess_miss_key(url))
+    except Exception:
+        return None
+    if not isinstance(miss, dict):
+        return None
+    if miss.get('kind') == 'portfolio':
+        return PortfolioError(miss['status'], miss['detail'])
+    return SourceFailure(miss['detail'], category=miss.get('category'), stage=miss.get('stage'), evidence=miss.get('evidence'), status=miss.get('status'))
+
+
+def _remember_miss(url: str, exc: Exception) -> None:
+    """Remember a guessed file that is not there or not a workbook; never a timeout or a server error."""
+    if isinstance(exc, SourceFailure):
+        if (exc.evidence or {}).get('http_status') not in GUESS_MISS_HTTP:
+            return
+        miss = {'kind': 'source', 'detail': str(exc), 'category': exc.category, 'stage': exc.stage, 'evidence': exc.evidence, 'status': getattr(exc, 'status', None)}
+    elif isinstance(exc, PortfolioError):
+        miss = {'kind': 'portfolio', 'status': exc.status, 'detail': str(exc)}
+    else:
+        return
+    try:
+        cache.set(_guess_miss_key(url), miss, timeout=GUESS_MISS_SECONDS)
+    except Exception:
+        logger.exception('Could not remember the missing file %s', url)
+
+
 def _cached_file(key: tuple[str, str], url: str) -> bytes | None:
     entry = _portfolio_file_cache.get(key)
     return entry[1][url] if entry and entry[0] > datetime.now() and url in entry[1] else None
@@ -649,7 +689,16 @@ def _download_cached(amc_key: str, month: str, url: str, *, guessed: bool = Fals
             hit = _cached_file(key, url)
             if hit is not None:
                 return hit
-        payload = _download_portfolio_file(amc_key, url, **({'guessed': True} if guessed else {}))
+        if guessed:
+            remembered = _remembered_miss(url)
+            if remembered is not None:
+                raise remembered
+        try:
+            payload = _download_portfolio_file(amc_key, url, **({'guessed': True} if guessed else {}))
+        except ProviderError as exc:
+            if guessed:
+                _remember_miss(url, exc)
+            raise
         with _download_lock:
             now = datetime.now()
             entry = _portfolio_file_cache.get(key)

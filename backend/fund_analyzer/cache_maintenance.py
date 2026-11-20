@@ -34,7 +34,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from .portfolio_store import MONTH_FILE, SOURCE_CHARLIE, SOURCE_IMPORT, _read_json, _valid_snapshot
+from .portfolio_store import MONTH_FILE, SOURCE_CHARLIE, SOURCE_IMPORT, _read_json, _valid_snapshot, forget_shared
 
 GRACE_SECONDS = 60 * 60
 JOB_TTL_SECONDS = 60 * 60
@@ -245,9 +245,11 @@ def apply_plan(plan: Plan, archive_dir: Path | None = None) -> dict[str, Any]:
                     if target.exists():
                         target = target.with_name(f'{target.stem}.{int(time.time())}{target.suffix}')
                     shutil.move(str(path), str(target))
+                    forget_shared(path)
                     done['archived'] += 1
                 else:
                     path.unlink()
+                    forget_shared(path)
                     done['deleted'] += 1
                 emptied_here.add(path.parent)
                 done['bytes'] += action.size

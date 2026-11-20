@@ -19,11 +19,12 @@ import tempfile
 import time
 from collections import Counter, OrderedDict
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Any
 
 from django.conf import settings
+from django.core.cache import cache
 
 from .adapters import (
     AMBIGUOUS_MAPPING,
@@ -101,7 +102,96 @@ def _portfolio_dir(record: dict[str, Any]) -> Path:
     return Path(settings.FUND_ANALYZER_HOLDINGS_CACHE_DIR) / _slug(record.get('amc')) / _slug(normalise_name(str(record.get('scheme_name') or '')))
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+# --- Shared copy in Redis (FUND_ANALYZER_HOLDINGS_SHARED_CACHE) ---------------------------------------------
+# The folder stays the working store; Redis holds a copy of each file and, per folder, the list of its files.
+# A file missing from this instance's folder (a new Vercel instance starts with an empty /tmp) is written back
+# from the copy before it is read, so verified holdings are downloaded and parsed once, not once per instance.
+SHARED_PREFIX = 'fund-analyzer:files:v1:'
+SHARED_SECONDS = 400 * 86400  # beyond the longest retention; the folder's cleanup rules still apply to it
+SHARED_SKIP = ('jobs',)  # overlap jobs belong to the instance running them
+
+
+def _shared_name(path: Path) -> str | None:
+    """The file's path inside the holdings folder, as the Redis key uses it; None if it is not shared."""
+    if not getattr(settings, 'FUND_ANALYZER_HOLDINGS_SHARED_CACHE', False):
+        return None
+    try:
+        relative = Path(os.path.abspath(path)).relative_to(os.path.abspath(settings.FUND_ANALYZER_HOLDINGS_CACHE_DIR))
+    except ValueError:
+        return None
+    if not relative.parts or relative.parts[0] in SHARED_SKIP:
+        return None
+    return relative.as_posix()
+
+
+def _share(path: Path, payload: dict[str, Any]) -> None:
+    name = _shared_name(path)
+    if not name:
+        return
+    try:
+        cache.set(SHARED_PREFIX + name, payload, timeout=SHARED_SECONDS)
+        folder = PurePosixPath(name)
+        index_key = f'{SHARED_PREFIX}dir:{folder.parent.as_posix()}'
+        names = cache.get(index_key) or []
+        if folder.name not in names:
+            cache.set(index_key, sorted({*names, folder.name}), timeout=SHARED_SECONDS)
+    except Exception:
+        logger.exception('Shared copy of %s could not be saved', name)
+
+
+def _restore(path: Path) -> bool:
+    """Write a missing file back from its shared copy. True if it now exists."""
+    name = _shared_name(path)
+    if not name:
+        return False
+    try:
+        payload = cache.get(SHARED_PREFIX + name)
+    except Exception:
+        logger.exception('Shared copy of %s could not be read', name)
+        return False
+    if not isinstance(payload, dict):
+        return False
+    try:
+        _write_json_atomic(path, payload, share=False)
+        return True
+    except OSError:
+        logger.exception('Shared copy of %s could not be written to %s', name, path)
+        return False
+
+
+def forget_shared(path: Path) -> None:
+    """Remove a deleted or archived file's shared copy, so it is not written back."""
+    name = _shared_name(path)
+    if not name:
+        return
+    try:
+        cache.delete(SHARED_PREFIX + name)
+        folder = PurePosixPath(name)
+        index_key = f'{SHARED_PREFIX}dir:{folder.parent.as_posix()}'
+        names = cache.get(index_key) or []
+        if folder.name in names:
+            cache.set(index_key, [item for item in names if item != folder.name], timeout=SHARED_SECONDS)
+    except Exception:
+        logger.exception('Shared copy of %s could not be removed', name)
+
+
+def restore_folder(folder: Path) -> None:
+    """Write back every shared file of this folder that is missing here, before the folder is listed."""
+    name = _shared_name(folder)
+    if not name:
+        return
+    try:
+        names = cache.get(f'{SHARED_PREFIX}dir:{name}') or []
+    except Exception:
+        logger.exception('Shared file list of %s could not be read', name)
+        return
+    for file_name in names:
+        target = folder / file_name
+        if not target.exists():
+            _restore(target)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any], *, share: bool = True) -> None:
     """Write to a temporary file, then swap it in. Readers see the old file or the new one."""
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temp_name = tempfile.mkstemp(prefix=f'.{path.stem}-', suffix='.tmp', dir=path.parent)
@@ -113,6 +203,8 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         for attempt in range(5):
             try:
                 os.replace(temp_name, path)
+                if share:
+                    _share(path, payload)
                 return
             except PermissionError:
                 # Windows refuses to replace a file another process is reading at this moment.
@@ -150,7 +242,7 @@ def _signature(path: Path) -> tuple[int, int, int]:
     return info.st_mtime_ns, info.st_size, info.st_ino
 
 
-def _read_entry(path: Path) -> list[Any] | None:
+def _read_entry(path: Path, *, restore: bool = True) -> list[Any] | None:
     """[signature, payload, checks] for a JSON file, parsed once per version of the file."""
     key = str(path)
     try:
@@ -158,6 +250,8 @@ def _read_entry(path: Path) -> list[Any] | None:
     except FileNotFoundError:
         with _parsed_lock:
             _parsed.pop(key, None)
+        if restore and _restore(path):
+            return _read_entry(path, restore=False)
         return None
     except OSError:
         payload = _read_json(path)
@@ -312,6 +406,7 @@ def store_snapshot(record: dict[str, Any], code: str, month: str, result: dict[s
 def stored_links(record: dict[str, Any]) -> list[dict[str, Any]]:
     """The verified months available for this portfolio, newest first."""
     links = []
+    restore_folder(_portfolio_dir(record))
     try:
         names = sorted((entry.name for entry in os.scandir(_portfolio_dir(record))), reverse=True)
     except OSError:

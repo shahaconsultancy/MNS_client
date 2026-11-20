@@ -229,8 +229,9 @@ def read_health(amc_key: str) -> dict[str, Any]:
 
 
 def all_health() -> list[dict[str, Any]]:
-    from .portfolio_store import _read_entry
+    from .portfolio_store import _read_entry, restore_folder
 
+    restore_folder(_health_dir())
     try:
         paths = sorted(_health_dir().glob('*.json'))
     except OSError:
