@@ -322,6 +322,11 @@
 }
 
 .fa-notice svg { flex-shrink: 0; margin-top: 2px; color: #8a6420; }
+.fa-notice__content { min-width: 0; flex: 1; }
+.fa-notice__body { display: block; }
+/* Five lines of 12px text at line-height 1.5. */
+.fa-notice__body--clamped { max-height: calc(5 * 1.5em); overflow: hidden; }
+.fa-notice__more { margin-top: 4px; padding: 0; border: 0; background: none; font: inherit; font-weight: 600; color: #8a6420; cursor: pointer; text-decoration: underline; }
 
 /* Compare table */
 .fa-table-wrap { overflow-x: auto; }

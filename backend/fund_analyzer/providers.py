@@ -21,6 +21,10 @@ AMFI_HISTORY_DOWNLOAD_URL = 'https://portal.amfiindia.com/DownloadNAVHistoryRepo
 AMFI_HISTORY_URL = 'https://www.amfiindia.com/api/nav-history'
 # After AMFI history fails for a scheme, go straight to the backup for this long instead of waiting again.
 AMFI_HISTORY_RETRY_SECONDS = 15 * 60
+# After AMFI's NAV-history service refuses a request with 429 Too Many Requests, it is left alone for
+# this long, shared by every request, and NAV history comes from the MFAPI backup meanwhile.
+AMFI_HISTORY_BUSY_KEY = 'fund-analyzer:amfi:history-busy'
+AMFI_HISTORY_BUSY_SECONDS = 120
 AMFI_TER_URL = 'https://www.amfiindia.com/api/populate-te-rdata-revised'
 AMFI_TER_PAGE_URL = 'https://www.amfiindia.com/ter-of-mf-schemes'
 AMFI_DISCLOSURE_DIRECTORY_URL = 'https://www.amfiindia.com/online-center/portfolio-disclosure'
@@ -300,17 +304,27 @@ def fetch_amfi_history(scheme_code: str, start: date, end: date) -> list[dict[st
     key = f'fund-analyzer:amfi:history:{scheme_code}:{start.isoformat()}:{end.isoformat()}'
     failed_key = f'fund-analyzer:amfi:history-failed:{scheme_code}'
     try:
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
         if cache.get(failed_key):
             raise ProviderError(f'AMFI history for scheme {scheme_code} failed recently; using the backup source')
+        if cache.get(AMFI_HISTORY_BUSY_KEY):
+            # AMFI just refused a burst (429 Too Many Requests). Every fund asked meanwhile goes to the backup at once,
+            # instead of each one waiting for its own refusal: 36 funds cost one refused request, not 36.
+            raise ProviderError('AMFI NAV history is busy right now; using the backup source')
     except ProviderError:
         raise
     except Exception:
         logger.exception('Fund Analyzer cache read failed for %s', failed_key)
     try:
         return _cached_provider_value(key, load, ttl=86400, stale_ttl=604800)
-    except ProviderError:
+    except ProviderError as exc:
         try:
             cache.set(failed_key, True, timeout=AMFI_HISTORY_RETRY_SECONDS)
+            # Only a 429 speaks for the whole service. A timeout or a missing scheme is this scheme's own failure.
+            if (getattr(exc, 'evidence', None) or {}).get('http_status') == 429:
+                cache.set(AMFI_HISTORY_BUSY_KEY, True, timeout=AMFI_HISTORY_BUSY_SECONDS)
         except Exception:
             logger.exception('Fund Analyzer cache write failed for %s', failed_key)
         raise

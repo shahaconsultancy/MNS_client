@@ -1,5 +1,28 @@
-import { useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { Info } from 'lucide-react';
+
+// A notice that stops after five lines, with a toggle to read the rest. The PDF export unclips it.
+function ClampedNotice({ children, role }) {
+  const body = useRef(null);
+  const [open, setOpen] = useState(false);
+  const [overflows, setOverflows] = useState(false);
+  useLayoutEffect(() => {
+    const el = body.current;
+    if (!el) return undefined;
+    const check = () => setOverflows(el.scrollHeight > el.clientHeight + 1);
+    check();
+    const observer = new ResizeObserver(check);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [children]);
+  return <div className="fa-notice" role={role}>
+    <Info size={15} />
+    <div className="fa-notice__content">
+      <span ref={body} className={`fa-notice__body${open ? '' : ' fa-notice__body--clamped'}`}>{children}</span>
+      {(overflows || open) && <button type="button" className="fa-notice__more" onClick={() => setOpen((value) => !value)}>{open ? 'Show less' : 'Show more'}</button>}
+    </div>
+  </div>;
+}
 
 const SCALE_MAX = 60;
 const TOP_PAIRS = 5;
@@ -155,14 +178,11 @@ function MonthNotice({ overlap, pairs, funds }) {
   const missing = overlap.pair_reasons || [];
   const mixed = overlap.pairs_different_months;
   if (!mixed && !missing.length) return null;
-  return <p className="fa-notice" role="note">
-    <Info size={15} />
-    <span>
+  return <ClampedNotice role="note">
       {mixed && <><strong>Mixed reporting months.</strong> No single month is common to all selected funds, so each pair uses the latest month its own two funds share: {pairs.map((pair) => `${nameOf(pair.left.scheme_code)} × ${nameOf(pair.right.scheme_code)} (${monthLabel(pair.portfolio_month)})`).join('; ')}. A pair is never compared across two different months, but figures from different months are not directly comparable. </>}
       {!mixed && overlap.common_month && pairs.length > 1 && <><strong>One reporting month.</strong> Every pair uses {monthLabel(overlap.common_month)}. </>}
       {missing.length > 0 && <><strong>Compared {overlap.compared_pairs} of {overlap.total_pairs} pairs.</strong> Not compared: {missing.map((gap) => `${nameOf(gap.left)} × ${nameOf(gap.right)} (${gap.reason_code === 'NO_COMMON_REPORTING_MONTH' && gap.left_portfolio_month && gap.right_portfolio_month ? `no common month: ${monthLabel(gap.left_portfolio_month)} vs ${monthLabel(gap.right_portfolio_month)}` : gap.message})`).join('; ')}.</>}
-    </span>
-  </p>;
+  </ClampedNotice>;
 }
 
 export default function OverlapTab({ funds, overlap, overlapLoading, overlapStage, onHistoricalMonth }) {
@@ -182,17 +202,14 @@ export default function OverlapTab({ funds, overlap, overlapLoading, overlapStag
   const notEquityOnly = (overlap.funds || []).some((fund) => fund.asset_class && fund.asset_class !== 'equity');
 
   return <>
-    <p className="fa-notice">
-      <Info size={15} />
-      <span>
+    <ClampedNotice>
         <strong>Official AMC holdings.</strong> Overlap uses each fund's disclosed {notEquityOnly ? 'securities' : 'equity portfolio'}, matched by ISIN{month ? `, as of ${month}` : ''}.
         {overlap.unavailable_pairs?.filter((item) => !unavailableReason[item.reason]).length > 0 && ` ${overlap.unavailable_pairs.filter((item) => !unavailableReason[item.reason]).length} pair(s) could not be compared because the holdings could not be fully read.`}
         {overlap.unavailable_pairs?.some((item) => unavailableReason[item.reason]) && ` ${unavailableReason.FOF_LOOKTHROUGH_UNAVAILABLE}`}
         {thirdParty.length > 0 && ` Holdings source: Third-party API for ${thirdParty.map((fund) => fund.scheme_name).join('; ')}; all other holdings are from the official AMC.`}
         {unclassified.length > 0 && ` Incomplete coverage: ${unclassified.map((fund) => `${fund.scheme_name} has ${fund.unclassified_pct.toFixed(2)}% of NAV we could not classify`).join('; ')}.`}
         {skipped.length > 0 && ` Not compared: ${skipped.map((fund) => `${fund.scheme_name || fund.scheme_code} (${fund.status_message || fund.reason})`).join('; ')}.`}
-      </span>
-    </p>
+    </ClampedNotice>
     <MonthNotice overlap={overlap} pairs={pairs} funds={funds} />
     <HistoricalPicker overlap={overlap} onSelect={onHistoricalMonth} />
     {/* Beyond five funds the matrix needs the full width, so the pair details go below it. */}

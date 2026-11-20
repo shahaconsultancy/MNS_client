@@ -66,17 +66,37 @@ def _base_detail(record: dict[str, Any], *, source: str, as_of: str | None) -> d
     }
 
 
+def _is_price(row: dict[str, Any]) -> bool:
+    return isinstance(row.get('nav'), (int, float)) and not isinstance(row.get('nav'), bool) and row['nav'] > 0
+
+
+def _priced_history(history: list[dict[str, Any]], scheme_code: str) -> list[dict[str, Any]]:
+    """The NAV history without rows that are not prices.
+
+    A zero or negative NAV is not a price. A scheme whose latest NAV is one (a segregated portfolio
+    publishes 0) keeps its history as it is, and gets no metrics. A live scheme with the odd zero row
+    (MFAPI has a few, years old) loses just those rows, so its returns use real prices only.
+    """
+    if not history or not _is_price(history[-1]):
+        return history
+    priced = [row for row in history if _is_price(row)]
+    if len(priced) != len(history):
+        logger.info('Scheme %s: ignored %d NAV row(s) that are zero or negative', scheme_code, len(history) - len(priced))
+    return priced
+
+
 def _metrics_or_reason(history: list[dict[str, Any]], risk_free_rate: float, scheme_code: str) -> tuple[dict[str, Any] | None, str | None]:
     """Metrics for a usable NAV history, or None and the reason.
 
-    A zero or negative NAV is not a price (segregated portfolios publish 0), and returns over it
-    are undefined, so such a history gets no metrics instead of failing the whole comparison.
-    Every other history goes to metrics() unchanged.
+    Pass the history through _priced_history first. If a zero or negative NAV is still in it, the
+    scheme's latest NAV is not a price (for example a segregated portfolio), so returns are undefined
+    and it gets no metrics instead of failing the whole comparison. Every other history goes to
+    metrics() unchanged.
     """
     if not history:
         return None, None
-    if any(not isinstance(row.get('nav'), (int, float)) or row['nav'] <= 0 for row in history):
-        logger.warning('Scheme %s has zero or negative NAVs in its history; returns and risk are not calculated', scheme_code)
+    if any(not _is_price(row) for row in history):
+        logger.warning('Scheme %s reports a zero or negative latest NAV; returns and risk are not calculated', scheme_code)
         return None, 'Returns and risk are not available: this scheme reports a zero NAV (for example a segregated portfolio).'
     return metrics(history, risk_free_rate), None
 
@@ -94,7 +114,7 @@ def fetch_fund_data(scheme_code: str, *, risk_free_rate: float = 0.065, include_
         history = []
         if include_history:
             start, end = _today_window()
-            history = fetch_amfi_history(scheme_code, start, end)
+            history = _priced_history(fetch_amfi_history(scheme_code, start, end), scheme_code)
         ter, ter_as_of = (None, None)
         aum, aum_as_of = (None, None)
         if include_metadata:
@@ -109,6 +129,7 @@ def fetch_fund_data(scheme_code: str, *, risk_free_rate: float = 0.065, include_
         try:
             payload = fetch_mfapi_data(scheme_code)
             meta, history = parse_mfapi(payload, scheme_code)
+            history = _priced_history(history, scheme_code)
             # One scheme code is one plan and one option. If AMFI and MFAPI disagree about which,
             # MFAPI's NAV history is another fund's, and showing it would mix the two.
             amfi_record = next((row for row in (latest_records or []) if str(row.get('scheme_code')) == str(scheme_code)), None)
@@ -202,6 +223,21 @@ def search_funds(query: str, limit: int = SEARCH_RESULT_LIMIT, offset: int = 0) 
     return {**meta, 'asOfDate': _iso_date(as_of), 'total': len(matched), 'results': page}
 
 
+COMPARE_OMITTED_SERIES = ('growthOf10000', 'rollingReturns')
+NAV_HISTORY_UNAVAILABLE ='NAV history could not be loaded right now, so returns and risk are not shown. Press Update analysis again in a moment.'
+
+
+def _unavailable_fund(scheme_code: str, latest_records: list[dict[str, Any]]) -> dict[str, Any]:
+    """A fund row with no figures, named from the AMFI scheme list, for a fund whose NAV history failed."""
+    record = next((row for row in latest_records if str(row.get('scheme_code')) == str(scheme_code)), None) or {'scheme_code': scheme_code}
+    result = _base_detail(record, source='AMFI', as_of=record.get('date'))
+    result.update({
+        'ter': None, 'ter_as_of': None, 'aum': None, 'aum_unit': None, 'aum_as_of': None,
+        'history': [], 'metrics': None, 'metrics_unavailable': NAV_HISTORY_UNAVAILABLE, 'history_unavailable': True,
+    })
+    return result
+
+
 def compare_funds(scheme_codes: list[str], risk_free_rate: float = 0.065) -> dict[str, Any]:
     started = perf_counter()
     try:
@@ -214,12 +250,20 @@ def compare_funds(scheme_codes: list[str], risk_free_rate: float = 0.065) -> dic
 
     # History and analytics are the critical path for Compare. AUM still loads only
     # when the client opens Fundamentals.
+    # One fund that cannot be loaded (both NAV sources down, or the backup holding another plan's data) is
+    # reported on its own row. It never fails the comparison of every other fund the client selected.
+    def load(code: str) -> dict[str, Any]:
+        try:
+            return fetch_fund_data(code, risk_free_rate=risk_free_rate, include_metadata=False, latest_records=latest_records)
+        except ProviderError as exc:
+            logger.warning('Fund Analyzer comparison: scheme %s unavailable: %s', code, exc)
+            return _unavailable_fund(code, latest_records)
+
     worker_count = min(4, len(scheme_codes))
     with ThreadPoolExecutor(max_workers=max(1, worker_count)) as pool:
-        funds = list(pool.map(
-            lambda code: fetch_fund_data(code, risk_free_rate=risk_free_rate, include_metadata=False, latest_records=latest_records),
-            scheme_codes,
-        ))
+        funds = list(pool.map(load, scheme_codes))
+    if all(fund.get('history_unavailable') for fund in funds):
+        raise ProviderError('No selected fund could be loaded from AMFI or MFAPI')
     # TER shares a host with NAV history, and that host throttles bursts, so load it
     # afterwards. A TER failure must not fail the comparison.
     try:
@@ -237,6 +281,12 @@ def compare_funds(scheme_codes: list[str], risk_free_rate: float = 0.065) -> dic
                 matrix[left['scheme_code']][right['scheme_code']] = 1.0
             else:
                 matrix[left['scheme_code']][right['scheme_code']] = correlation(left['history'], right['history'])
+    # The page shows each fund's figures, never these daily chart series (about 530 KB a fund). Leaving them out
+    # keeps a comparison far below the 4.5 MB response limit of serverless hosting such as Vercel: 36 funds were
+    # 10.9 MB with them. The single-fund endpoint still returns them.
+    for fund in funds:
+        if isinstance(fund.get('metrics'), dict):
+            fund['metrics'] = {key: value for key, value in fund['metrics'].items() if key not in COMPARE_OMITTED_SERIES}
     source = 'MFAPI (backup)' if any(fund['source'] == 'MFAPI (backup)' for fund in funds) else 'AMFI'
     as_of = max((fund.get('asOfDate') for fund in funds if fund.get('asOfDate')), default=None)
     valid = [fund for fund in funds if fund.get('metrics')]
