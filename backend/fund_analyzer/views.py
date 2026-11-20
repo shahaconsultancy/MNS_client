@@ -86,7 +86,15 @@ class FundCompareView(APIView):
             validated = request_serializer.validated_data
             risk_free_rate = validated.get('risk_free_rate')
             payload = compare_funds(validated['scheme_codes'], risk_free_rate if risk_free_rate is not None else settings.FUND_ANALYZER_RISK_FREE_RATE)
-            return Response(CompareResponseSerializer(payload).data)
+            timings = payload.pop('timings', None) or {}
+            response = Response(CompareResponseSerializer(payload).data)
+            # Where the time went (cache, amfi, mfapi, validate, calc, ...) and how many histories came from the
+            # store, for the browser's network panel. Durations are summed across the worker threads.
+            parts = [f'{name};dur={ms}' for name, ms in timings.get('ms', {}).items()]
+            parts += [f'{name};desc="{count}"' for name, count in timings.get('counts', {}).items()]
+            if parts:
+                response['Server-Timing'] = ', '.join(parts)
+            return response
         except ProviderError as exc:
             return _unavailable('Fund data is temporarily unavailable. Please try again shortly.', exc, source='MFAPI (backup)', asOfDate=None)
 

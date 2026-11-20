@@ -279,6 +279,49 @@ def _history_rows(payload: dict[str, Any], scheme_code: str) -> list[dict[str, A
     return rows
 
 
+# At most this many NAV-history requests to AMFI at once from one process, whatever the number of funds,
+# so a large comparison never sends AMFI a burst. Each Vercel instance is its own process.
+AMFI_HISTORY_CONCURRENCY = BoundedSemaphore(3)
+AMFI_HISTORY_BUSY_MAX_SECONDS = 600
+# One scheme timing out is that scheme's own problem, and other schemes still try AMFI. This many timeouts
+# within the window mean the service itself is slow (its five-year answers took over 8 s on 20 Nov 2026),
+# so for AMFI_HISTORY_BUSY_SECONDS the next funds go straight to the backup instead of each waiting 8 s.
+AMFI_HISTORY_SLOW_AFTER = 3
+AMFI_HISTORY_TIMEOUTS_KEY = 'fund-analyzer:amfi:history-timeouts'
+
+
+def _is_timeout(exc: Exception) -> bool:
+    evidence = getattr(exc, 'evidence', None) or {}
+    return 'Timeout' in str(evidence.get('error') or '') or 'timed out' in str(exc).lower()
+
+
+def _note_timeout() -> None:
+    """Count a history timeout; at AMFI_HISTORY_SLOW_AFTER within the window, mark the service busy for a while."""
+    try:
+        cache.add(AMFI_HISTORY_TIMEOUTS_KEY, 0, timeout=AMFI_HISTORY_BUSY_SECONDS)
+        try:
+            seen = cache.incr(AMFI_HISTORY_TIMEOUTS_KEY)
+        except ValueError:  # expired between add and incr
+            cache.set(AMFI_HISTORY_TIMEOUTS_KEY, 1, timeout=AMFI_HISTORY_BUSY_SECONDS)
+            seen = 1
+    except Exception:
+        logger.exception('Fund Analyzer cache write failed for %s', AMFI_HISTORY_TIMEOUTS_KEY)
+        return
+    if (seen or 0) >= AMFI_HISTORY_SLOW_AFTER:  # None: Redis unreachable, nothing counted
+        logger.warning('AMFI NAV history timed out %d times within %d s; using the backup source for %d s', seen, AMFI_HISTORY_BUSY_SECONDS, AMFI_HISTORY_BUSY_SECONDS)
+        cache.set(AMFI_HISTORY_BUSY_KEY, True, timeout=AMFI_HISTORY_BUSY_SECONDS)
+        cache.delete(AMFI_HISTORY_TIMEOUTS_KEY)
+
+
+def _busy_seconds(evidence: dict[str, Any]) -> int:
+    """How long AMFI asked us to wait (Retry-After, in seconds), within 2 to 10 minutes; 2 minutes if it did not say."""
+    try:
+        wait = int(float(str(evidence.get('retry_after')).strip()))
+    except (TypeError, ValueError):
+        return AMFI_HISTORY_BUSY_SECONDS
+    return max(AMFI_HISTORY_BUSY_SECONDS, min(AMFI_HISTORY_BUSY_MAX_SECONDS, wait))
+
+
 def fetch_amfi_history(scheme_code: str, start: date, end: date) -> list[dict[str, Any]]:
     def load() -> list[dict[str, Any]]:
         chunks: list[tuple[date, date]] = []
@@ -290,7 +333,16 @@ def fetch_amfi_history(scheme_code: str, start: date, end: date) -> list[dict[st
 
         def fetch_chunk(bounds: tuple[date, date]) -> list[dict[str, Any]]:
             chunk_start, chunk_end = bounds
-            response = fetch_url(AMFI_HISTORY_URL, params={'query_type': 'historical_period', 'from_date': chunk_start.isoformat(), 'to_date': chunk_end.isoformat(), 'sd_id': scheme_code}, timeout=(2, 8), attempts=1)
+            with AMFI_HISTORY_CONCURRENCY:
+                # Waiting for a slot can take a while; AMFI may have been marked busy or slow meanwhile.
+                if cache.get(AMFI_HISTORY_BUSY_KEY):
+                    raise ProviderError('AMFI NAV history is busy right now; using the backup source')
+                try:
+                    response = fetch_url(AMFI_HISTORY_URL, params={'query_type': 'historical_period', 'from_date': chunk_start.isoformat(), 'to_date': chunk_end.isoformat(), 'sd_id': scheme_code}, timeout=(2, 8), attempts=1)
+                except ProviderError as exc:
+                    if _is_timeout(exc):
+                        _note_timeout()
+                    raise
             chunk = _history_rows(response.json(), scheme_code)
             if not chunk:
                 raise ProviderError(f'AMFI returned no history for scheme {scheme_code}')
@@ -323,8 +375,10 @@ def fetch_amfi_history(scheme_code: str, start: date, end: date) -> list[dict[st
         try:
             cache.set(failed_key, True, timeout=AMFI_HISTORY_RETRY_SECONDS)
             # Only a 429 speaks for the whole service. A timeout or a missing scheme is this scheme's own failure.
-            if (getattr(exc, 'evidence', None) or {}).get('http_status') == 429:
-                cache.set(AMFI_HISTORY_BUSY_KEY, True, timeout=AMFI_HISTORY_BUSY_SECONDS)
+            evidence = getattr(exc, 'evidence', None) or {}
+            if evidence.get('http_status') == 429:
+                cache.set(AMFI_HISTORY_BUSY_KEY, True, timeout=_busy_seconds(evidence))
+
         except Exception:
             logger.exception('Fund Analyzer cache write failed for %s', failed_key)
         raise
