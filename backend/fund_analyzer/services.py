@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import contextvars
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from threading import Lock
 from time import perf_counter
 from typing import Any
+
+from django.core.cache import cache
 
 from .analytics import correlation, metrics
 from .holdings import analyze_holdings_overlap, fetch_fund_holdings, scheme_status
@@ -106,44 +112,291 @@ def _today_window() -> tuple[date, date]:
     return end - timedelta(days=365 * 5 + 7), end
 
 
+# --- Timing: where a comparison's time goes (cache, AMFI, MFAPI, validation, calculation) ----------------
+_timings: contextvars.ContextVar['Timings | None'] = contextvars.ContextVar('fund_analyzer_timings', default=None)
+
+
+class Timings:
+    """Durations and counts for one request, shared by its worker threads."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self.seconds: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+
+    def add(self, name: str, seconds: float) -> None:
+        with self._lock:
+            self.seconds[name] = self.seconds.get(name, 0.0) + seconds
+
+    def count(self, name: str) -> None:
+        with self._lock:
+            self.counts[name] = self.counts.get(name, 0) + 1
+
+    def summary(self) -> dict[str, Any]:
+        with self._lock:
+            return {'ms': {name: round(value * 1000) for name, value in self.seconds.items()}, 'counts': dict(self.counts)}
+
+
+@contextmanager
+def _timed(name: str):
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        collector = _timings.get()
+        if collector:
+            collector.add(name, perf_counter() - started)
+
+
+def _count(name: str) -> None:
+    collector = _timings.get()
+    if collector:
+        collector.count(name)
+
+
+# --- NAV history store: one entry per scheme, in the shared Django cache --------------------------------
+# Redis when REDIS_URL is set (shared by every process and every Vercel instance); otherwise each process's
+# own memory. The entry is checked against AMFI's latest NAV date for the scheme, so a history that already
+# reaches it is used without any request, and an older one is extended with just the missing days.
+NAV_CACHE_PREFIX = 'fund-analyzer:nav:v1:'
+NAV_CACHE_SECONDS = 30 * 86400  # kept a month, so an upstream outage can still be answered from it
+NAV_RECHECK_SECONDS = 6 * 3600  # when AMFI's latest date for the scheme is not known
+NAV_LAG_RECHECK_SECONDS = 30 * 60  # AMFI listed a newer NAV than its history service has yet
+NAV_LOCK_SECONDS = 45
+NAV_WAIT_SECONDS = 15  # how long a request waits for another process already fetching the same scheme
+STALE_HISTORY_NOTE = 'Returns and risk use NAV history up to {date}; newer NAVs could not be loaded right now. Press Update analysis again later for the newest figures.'
+_nav_locks: dict[str, Lock] = {}
+_nav_locks_guard = Lock()
+
+
+def _nav_key(scheme_code: str) -> str:
+    return f'{NAV_CACHE_PREFIX}{scheme_code}'
+
+
+def _cache_get(key: str) -> Any:
+    try:
+        return cache.get(key)
+    except Exception:
+        logger.exception('Fund Analyzer cache read failed for %s', key)
+        return None
+
+
+def _nav_fresh(entry: dict[str, Any] | None, newest: str | None) -> bool:
+    """True if the stored history needs no request: it reaches AMFI's latest NAV date, or was checked lately."""
+    if not entry or not entry.get('rows'):
+        return False
+    if newest:
+        if str(entry.get('last_date') or '') >= newest:
+            return True
+        # AMFI's history service can trail its latest-NAV list by a few hours. Having just asked, ask again later.
+        return entry.get('checked_for') == newest and time.time() - float(entry.get('checked_at') or 0) < NAV_LAG_RECHECK_SECONDS
+    return time.time() - float(entry.get('checked_at') or 0) < NAV_RECHECK_SECONDS
+
+
+def _valid_rows(rows: list[dict[str, Any]], scheme_code: str) -> list[dict[str, Any]]:
+    """NAV rows with a real date (not in the future) and a number, one per date, oldest first.
+
+    Prices are not changed; rows that cannot be read as a dated NAV are left out (and logged).
+    Zero or negative NAVs stay here and are handled by _priced_history, as before.
+    """
+    latest_allowed = (date.today() + timedelta(days=1)).isoformat()
+    by_date: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        day, nav = str(row.get('date') or ''), row.get('nav')
+        try:
+            date.fromisoformat(day)
+        except ValueError:
+            continue
+        if day > latest_allowed or not isinstance(nav, (int, float)) or isinstance(nav, bool):
+            continue
+        by_date[day] = row
+    if len(by_date) != len(rows):
+        logger.info('Scheme %s: kept %d of %d NAV rows (undated, future-dated or repeated dates left out)', scheme_code, len(by_date), len(rows))
+    return [by_date[day] for day in sorted(by_date)]
+
+
+def _mfapi_identity_problem(scheme_code: str, amfi_record: dict[str, Any] | None, raw_meta: dict[str, Any], meta: dict[str, Any]) -> str | None:
+    """Why MFAPI's data is not this exact scheme, or None. Backup data is never accepted on a near match."""
+    returned = str(raw_meta.get('scheme_code') or '').strip()
+    if returned and returned != str(scheme_code):
+        return f'MFAPI returned scheme {returned}, not {scheme_code}'
+    if not amfi_record:
+        return None
+    conflict = plan_option_conflict(amfi_record, meta)
+    if conflict:
+        return f'MFAPI data for scheme {scheme_code} is a different plan or option: {conflict}'
+    empty = {None, '', '-'}
+    amfi_isins = {str(value).strip().upper() for value in (amfi_record.get('isin'), amfi_record.get('isin_reinvest')) if value not in empty}
+    backup_isins = {str(value).strip().upper() for value in (raw_meta.get('isin_growth'), raw_meta.get('isin_div_reinvestment')) if value not in empty}
+    if amfi_isins and backup_isins and not amfi_isins & backup_isins:
+        return f'MFAPI data for scheme {scheme_code} has ISIN {", ".join(sorted(backup_isins))}, AMFI has {", ".join(sorted(amfi_isins))}'
+    return None
+
+
+def _refresh_nav(scheme_code: str, amfi_record: dict[str, Any] | None, entry: dict[str, Any] | None, newest: str | None = None) -> dict[str, Any]:
+    """A new store entry: AMFI first (only the missing days when an AMFI history is stored), then MFAPI.
+
+    AMFI's history is used only for a scheme in AMFI's latest NAV list, as before; MFAPI's only when it is
+    the exact scheme, plan and option.
+    """
+    start, end = _today_window()
+    if amfi_record is not None:
+        try:
+            if entry and entry.get('source') == 'AMFI' and entry.get('rows'):
+                since = date.fromisoformat(entry['last_date']) + timedelta(days=1)
+                try:
+                    with _timed('amfi'):
+                        fresh = fetch_amfi_history(scheme_code, since, end) if since <= end else []
+                except ProviderError as exc:
+                    if 'returned no history' not in str(exc):
+                        raise
+                    fresh = []  # nothing newer published yet: keep the stored history, not a failure
+                rows = [*entry['rows'], *fresh]
+                _count('amfi_incremental')
+            else:
+                with _timed('amfi'):
+                    rows = fetch_amfi_history(scheme_code, start, end)
+                _count('amfi_full')
+            with _timed('validate'):
+                rows = _valid_rows(rows, scheme_code)
+            if not rows:
+                raise ProviderError(f'AMFI returned no usable history for scheme {scheme_code}')
+            # Kept a month beyond the five-year window, so the stored history does not grow without end.
+            keep_from = (start - timedelta(days=31)).isoformat()
+            rows = [row for row in rows if row['date'] >= keep_from] or rows
+            return {'source': 'AMFI', 'rows': rows, 'meta': dict(amfi_record), 'last_date': rows[-1]['date'], 'checked_at': time.time(), 'checked_for': newest}
+        except (ProviderError, ValueError, TypeError, KeyError) as exc:
+            logger.warning('AMFI fallback for scheme %s: %s', scheme_code, exc)
+    with _timed('mfapi'):
+        payload = fetch_mfapi_data(scheme_code)
+        meta, rows = parse_mfapi(payload, scheme_code)
+    _count('mfapi')
+    with _timed('validate'):
+        problem = _mfapi_identity_problem(scheme_code, amfi_record, (payload or {}).get('meta') or {}, meta)
+        if problem:
+            _count('mfapi_rejected')
+            raise ProviderError(problem)
+        rows = _valid_rows(rows, scheme_code)
+    if not rows:
+        raise ProviderError(f'MFAPI returned no usable history for scheme {scheme_code}')
+    return {'source': 'MFAPI', 'rows': rows, 'meta': meta, 'last_date': rows[-1]['date'], 'checked_at': time.time()}
+
+
+def _lock_for(scheme_code: str) -> Lock:
+    with _nav_locks_guard:
+        return _nav_locks.setdefault(str(scheme_code), Lock())
+
+
+def _served(entry: dict[str, Any], *, stale: bool) -> dict[str, Any]:
+    """The rows a caller uses: an AMFI history over the usual five-year window, an MFAPI history as received."""
+    rows = entry['rows']
+    if entry.get('source') == 'AMFI':
+        start, end = _today_window()
+        rows = [row for row in rows if start.isoformat() <= row['date'] <= end.isoformat()]
+    return {'source': entry.get('source'), 'rows': rows, 'meta': entry.get('meta'), 'stale': stale, 'last_date': entry.get('last_date')}
+
+
+def _nav_history(scheme_code: str, amfi_record: dict[str, Any] | None) -> dict[str, Any]:
+    """The scheme's NAV history: from the store when current, refreshed once when not, stale only if refreshing fails.
+
+    Returns {source: 'AMFI'|'MFAPI', rows, meta, stale, last_date}. Raises ProviderError when no source has it.
+    Simultaneous requests for one scheme fetch it once: a lock per scheme inside each process, and a short
+    shared lock in the cache so another process waits for the first one's result instead of fetching again.
+    A stored history is never replaced by a failed refresh; it is served marked stale instead.
+    """
+    key = _nav_key(scheme_code)
+    newest = _iso_date(amfi_record.get('date')) if amfi_record else None
+    with _timed('cache'):
+        entry = _cache_get(key)
+    if _nav_fresh(entry, newest):
+        _count('cache_hit')
+        return _served(entry, stale=False)
+    with _lock_for(scheme_code):
+        with _timed('cache'):
+            entry = _cache_get(key) or entry
+        if _nav_fresh(entry, newest):
+            _count('cache_hit')
+            return _served(entry, stale=False)
+        owns = True
+        try:
+            # False means another process holds the lock. None is an unreachable Redis (IGNORE_EXCEPTIONS):
+            # nobody can hold it then, so fetch now rather than wait.
+            owns = cache.add(f'{key}:lock', True, timeout=NAV_LOCK_SECONDS) is not False
+        except Exception:
+            logger.exception('Fund Analyzer cache lock failed for %s', key)
+        if not owns:
+            waited_until = time.monotonic() + NAV_WAIT_SECONDS
+            while time.monotonic() < waited_until:
+                time.sleep(0.25)
+                current = _cache_get(key)
+                if _nav_fresh(current, newest):
+                    _count('cache_hit_after_wait')
+                    return _served(current, stale=False)
+        _count('cache_miss')
+        try:
+            fresh = _refresh_nav(scheme_code, amfi_record, entry, newest)
+        except (ProviderError, ValueError, TypeError, KeyError) as exc:
+            if entry and entry.get('rows'):
+                logger.warning('Scheme %s: serving stored NAV history up to %s; refresh failed: %s', scheme_code, entry.get('last_date'), exc)
+                _count('stale_served')
+                return _served(entry, stale=True)
+            _count('failed')
+            raise ProviderError(f'Unable to load scheme {scheme_code} from AMFI or MFAPI') from exc
+        finally:
+            if owns:
+                try:
+                    cache.delete(f'{key}:lock')
+                except Exception:
+                    logger.exception('Fund Analyzer cache unlock failed for %s', key)
+        try:
+            cache.set(key, fresh, timeout=NAV_CACHE_SECONDS)
+        except Exception:
+            logger.exception('Fund Analyzer cache write failed for %s', key)
+        return _served(fresh, stale=False)
+
+
 def fetch_fund_data(scheme_code: str, *, risk_free_rate: float = 0.065, include_history: bool = True, include_metadata: bool = True, latest_records: list[dict[str, Any]] | None = None, ter_snapshot: dict[str, tuple[float | None, str | None]] | None = None, aum_data: tuple[float | None, str | None] | None = None) -> dict[str, Any]:
-    """Fetch a fund live, preferring AMFI and using MFAPI only on AMFI failure."""
+    """Fetch a fund: NAV history from the store first, then AMFI, then a validated MFAPI copy."""
     try:
         latest_records = latest_records if latest_records is not None else fetch_amfi_latest()
-        latest = _pick_latest(latest_records, scheme_code)
-        history = []
-        if include_history:
-            start, end = _today_window()
-            history = _priced_history(fetch_amfi_history(scheme_code, start, end), scheme_code)
+    except ProviderError as exc:
+        logger.warning('AMFI latest snapshot unavailable for scheme %s: %s', scheme_code, exc)
+        latest_records = []
+    try:
+        amfi_record = _pick_latest(latest_records, scheme_code)
+    except ProviderError:
+        amfi_record = None
+
+    nav = None
+    if include_history or amfi_record is None:
+        nav = _nav_history(scheme_code, amfi_record)
+    history = []
+    if nav is not None and include_history:
+        with _timed('validate'):
+            history = _priced_history(nav['rows'], scheme_code)
+
+    if nav is not None and (nav['source'] == 'MFAPI' or amfi_record is None):
+        rows = history or nav['rows']
+        last = rows[-1] if rows else {}
+        source = 'MFAPI (backup)' if nav['source'] == 'MFAPI' else 'AMFI'
+        result = _base_detail({**(nav['meta'] or {}), 'scheme_code': scheme_code, **last}, source=source, as_of=last.get('date'))
+        result.update({'ter': None, 'ter_as_of': None, 'aum': None, 'aum_unit': None, 'aum_as_of': None, 'history': history})
+    else:
         ter, ter_as_of = (None, None)
         aum, aum_as_of = (None, None)
         if include_metadata:
             ter, ter_as_of = fetch_amfi_ter(scheme_code, latest_records, ter_snapshot)
-            aum, aum_as_of = aum_data if aum_data is not None else fetch_amfi_aum(latest.get('scheme_name') or '', latest.get('amc') or '')
-        result = _base_detail(latest, source='AMFI', as_of=latest.get('date'))
+            aum, aum_as_of = aum_data if aum_data is not None else fetch_amfi_aum(amfi_record.get('scheme_name') or '', amfi_record.get('amc') or '')
+        result = _base_detail(amfi_record, source='AMFI', as_of=amfi_record.get('date'))
         result.update({'ter': ter, 'ter_as_of': ter_as_of, 'aum': aum, 'aum_unit': 'lakhs' if aum is not None else None, 'aum_as_of': aum_as_of, 'history': history})
+    with _timed('calc'):
         result['metrics'], result['metrics_unavailable'] = _metrics_or_reason(history, risk_free_rate, scheme_code)
-        return result
-    except (ProviderError, ValueError, TypeError, KeyError) as exc:
-        logger.warning('AMFI fallback for scheme %s: %s', scheme_code, exc)
-        try:
-            payload = fetch_mfapi_data(scheme_code)
-            meta, history = parse_mfapi(payload, scheme_code)
-            history = _priced_history(history, scheme_code)
-            # One scheme code is one plan and one option. If AMFI and MFAPI disagree about which,
-            # MFAPI's NAV history is another fund's, and showing it would mix the two.
-            amfi_record = next((row for row in (latest_records or []) if str(row.get('scheme_code')) == str(scheme_code)), None)
-            conflict = plan_option_conflict(amfi_record, meta) if amfi_record else None
-            if conflict:
-                raise ProviderError(f'MFAPI data for scheme {scheme_code} is a different plan or option: {conflict}')
-            latest = history[-1]
-            result = _base_detail({**meta, **latest}, source='MFAPI (backup)', as_of=latest.get('date'))
-            result.update({'ter': None, 'ter_as_of': None, 'aum': None, 'aum_unit': None, 'aum_as_of': None, 'history': history})
-            result['metrics'], result['metrics_unavailable'] = _metrics_or_reason(history, risk_free_rate, scheme_code)
-            return result
-        except (ProviderError, ValueError, TypeError, KeyError) as backup_exc:
-            logger.error('AMFI and MFAPI failed for scheme %s: %s', scheme_code, backup_exc)
-            raise ProviderError(f'Unable to load scheme {scheme_code} from AMFI or MFAPI') from backup_exc
+    if nav is not None and include_history:
+        result['history_as_of'] = nav['last_date']
+        result['history_stale'] = nav['stale']
+        if nav['stale'] and not result['metrics_unavailable']:
+            result['history_note'] = STALE_HISTORY_NOTE.format(date=nav['last_date'])
+    return result
 
 
 SEARCH_RESULT_LIMIT = 50
@@ -240,8 +493,18 @@ def _unavailable_fund(scheme_code: str, latest_records: list[dict[str, Any]]) ->
 
 def compare_funds(scheme_codes: list[str], risk_free_rate: float = 0.065) -> dict[str, Any]:
     started = perf_counter()
+    collector = Timings()
+    token = _timings.set(collector)
     try:
-        latest_records = fetch_amfi_latest()
+        return _compare_funds(scheme_codes, risk_free_rate, collector, started)
+    finally:
+        _timings.reset(token)
+
+
+def _compare_funds(scheme_codes: list[str], risk_free_rate: float, collector: Timings, started: float) -> dict[str, Any]:
+    try:
+        with _timed('amfi_latest'):
+            latest_records = fetch_amfi_latest()
     except ProviderError as exc:
         logger.warning('AMFI latest snapshot unavailable for comparison: %s', exc)
         # An empty snapshot skips another latest-NAV retry per selected fund and
@@ -253,6 +516,7 @@ def compare_funds(scheme_codes: list[str], risk_free_rate: float = 0.065) -> dic
     # One fund that cannot be loaded (both NAV sources down, or the backup holding another plan's data) is
     # reported on its own row. It never fails the comparison of every other fund the client selected.
     def load(code: str) -> dict[str, Any]:
+        _timings.set(collector)  # each worker thread reports into this request's timings
         try:
             return fetch_fund_data(code, risk_free_rate=risk_free_rate, include_metadata=False, latest_records=latest_records)
         except ProviderError as exc:
@@ -267,20 +531,24 @@ def compare_funds(scheme_codes: list[str], risk_free_rate: float = 0.065) -> dic
     # TER shares a host with NAV history, and that host throttles bursts, so load it
     # afterwards. A TER failure must not fail the comparison.
     try:
-        ter_snapshot = fetch_amfi_ter_snapshot(scheme_codes, latest_records)
+        with _timed('ter'):
+            ter_snapshot = fetch_amfi_ter_snapshot(scheme_codes, latest_records)
     except Exception:
         logger.exception('Fund Analyzer TER lookup failed')
         ter_snapshot = {}
     for fund in funds:
         fund['ter'], fund['ter_as_of'] = ter_snapshot.get(fund['scheme_code'], (None, None))
-    logger.info('Fund Analyzer comparison loaded %d funds in %.2fs', len(funds), perf_counter() - started)
     matrix = {fund['scheme_code']: {} for fund in funds}
-    for left in funds:
-        for right in funds:
-            if left['scheme_code'] == right['scheme_code']:
-                matrix[left['scheme_code']][right['scheme_code']] = 1.0
-            else:
-                matrix[left['scheme_code']][right['scheme_code']] = correlation(left['history'], right['history'])
+    with _timed('correlation'):
+        for left in funds:
+            for right in funds:
+                if left['scheme_code'] == right['scheme_code']:
+                    matrix[left['scheme_code']][right['scheme_code']] = 1.0
+                else:
+                    matrix[left['scheme_code']][right['scheme_code']] = correlation(left['history'], right['history'])
+    collector.add('total', perf_counter() - started)
+    timings = collector.summary()
+    logger.info('Fund Analyzer comparison loaded %d funds in %.2fs; timings %s', len(funds), perf_counter() - started, timings)
     # The page shows each fund's figures, never these daily chart series (about 530 KB a fund). Leaving them out
     # keeps a comparison far below the 4.5 MB response limit of serverless hosting such as Vercel: 36 funds were
     # 10.9 MB with them. The single-fund endpoint still returns them.
@@ -293,7 +561,7 @@ def compare_funds(scheme_codes: list[str], risk_free_rate: float = 0.065) -> dic
     top_cagr = max(valid, key=lambda fund: fund['metrics'].get('r3y') if fund['metrics'].get('r3y') is not None else float('-inf'), default=None)
     best_sharpe = max(valid, key=lambda fund: fund['metrics'].get('sharpe') if fund['metrics'].get('sharpe') is not None else float('-inf'), default=None)
     lowest_vol = min(valid, key=lambda fund: fund['metrics'].get('volatility') if fund['metrics'].get('volatility') is not None else float('inf'), default=None)
-    return {'source': source, 'asOfDate': as_of, 'funds': funds, 'correlation': matrix, 'summary': {
+    return {'source': source, 'asOfDate': as_of, 'funds': funds, 'correlation': matrix, 'timings': timings, 'summary': {
         'riskFreeRate': risk_free_rate,
         'top3yCagr': top_cagr['scheme_code'] if top_cagr else None,
         'bestSharpe': best_sharpe['scheme_code'] if best_sharpe else None,

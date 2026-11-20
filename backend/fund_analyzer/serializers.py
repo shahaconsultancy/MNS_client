@@ -79,6 +79,11 @@ class FundDetailSerializer(SourceSerializer):
     asset_class = serializers.CharField(allow_null=True, required=False)
     metrics = MetricSetSerializer(allow_null=True, required=False)
     metrics_unavailable = serializers.CharField(allow_null=True, required=False)
+    # The last NAV date in the history behind the figures, and whether it is an older stored copy
+    # served because the newest NAVs could not be loaded (history_note then says so).
+    history_as_of = serializers.CharField(allow_null=True, required=False)
+    history_stale = serializers.BooleanField(required=False)
+    history_note = serializers.CharField(allow_null=True, required=False)
 
 
 class CompareRequestSerializer(serializers.Serializer):

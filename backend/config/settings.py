@@ -149,6 +149,12 @@ if REDIS_URL:
             'OPTIONS': {
                 'CLIENT_CLASS': 'django_redis.client.DefaultClient',
                 'CONNECTION_POOL_KWARGS': {'socket_connect_timeout': 1, 'socket_timeout': 1},
+                # Stored NAV histories are about 1,300 rows a fund; compressed they use far less of a hosted
+                # Redis plan's memory and bandwidth (Upstash on Vercel).
+                'COMPRESSOR': 'django_redis.compressors.zlib.ZlibCompressor',
+                # If Redis cannot be reached, behave as an empty cache instead of failing every request
+                # (the rate limits use the cache too). Data then comes from AMFI/MFAPI as before.
+                'IGNORE_EXCEPTIONS': True,
             },
             'KEY_PREFIX': 'mns',
             'TIMEOUT': 300,

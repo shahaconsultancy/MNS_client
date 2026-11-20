@@ -322,11 +322,33 @@
 }
 
 .fa-notice svg { flex-shrink: 0; margin-top: 2px; color: #8a6420; }
-.fa-notice__content { min-width: 0; flex: 1; }
-.fa-notice__body { display: block; }
-/* Five lines of 12px text at line-height 1.5. */
-.fa-notice__body--clamped { max-height: calc(5 * 1.5em); overflow: hidden; }
-.fa-notice__more { margin-top: 4px; padding: 0; border: 0; background: none; font: inherit; font-weight: 600; color: #8a6420; cursor: pointer; text-decoration: underline; }
+
+/* Overlap summary: reporting month, coverage, sources and exclusions in one card. */
+.fa-summary { margin: 0 0 14px; padding: 18px 22px; }
+.fa-summary__head h2 { margin: 0; font-size: 16px; font-weight: 600; color: var(--color-black); }
+.fa-summary__head p { margin: 3px 0 0; font-size: 12px; color: var(--color-gray); }
+.fa-summary__stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; margin: 14px 0 10px; border: 1px solid var(--fa-border); border-radius: 10px; }
+.fa-summary__stats > div { min-width: 0; padding: 10px 14px; }
+.fa-summary__stats > div + div { border-left: 1px solid var(--fa-border); }
+.fa-summary__stats dt { font-size: 10px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase; color: var(--fa-muted); }
+.fa-summary__stats dd { margin: 4px 0 0; font-size: 18px; font-weight: 700; color: var(--fa-navy); overflow-wrap: anywhere; }
+.fa-summary__warn { color: #8a6420; }
+.fa-summary__bar { height: 6px; border-radius: 3px; background: #ece6d8; overflow: hidden; }
+.fa-summary__bar b { display: block; height: 100%; border-radius: 3px; background: #c29035; }
+.fa-summary__notes { margin: 12px 0 0; padding: 0; list-style: none; font-size: 12px; line-height: 1.5; color: #4a5266; }
+.fa-summary__notes li + li { margin-top: 4px; }
+.fa-summary__notes strong { color: var(--fa-navy); font-weight: 600; }
+.fa-summary__details { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.fa-summary details { border: 1px solid var(--fa-border); border-radius: 10px; background: #fcfbf8; }
+.fa-summary summary { padding: 9px 14px; font-size: 12px; font-weight: 600; color: #8a6420; cursor: pointer; }
+.fa-summary details[open] summary { border-bottom: 1px solid var(--fa-border); }
+.fa-summary details > table, .fa-summary__group { margin: 10px 14px 12px; }
+.fa-summary details > table { width: calc(100% - 28px); }
+.fa-summary__group p { margin: 0 0 6px; font-size: 12px; color: #4a5266; }
+.fa-summary__group p span { color: var(--color-gray); }
+.fa-summary__table { width: 100%; border-collapse: collapse; font-size: 12px; color: #4a5266; }
+.fa-summary__table th { padding: 6px 8px; background: #faf8f3; font-size: 10px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase; color: #6b6b6b; text-align: left; }
+.fa-summary__table td { padding: 6px 8px; border-top: 1px solid var(--fa-border); vertical-align: top; overflow-wrap: anywhere; }
 
 /* Compare table */
 .fa-table-wrap { overflow-x: auto; }
@@ -432,6 +454,13 @@ td.fa-table__fund em {
   background: repeating-linear-gradient(45deg, #f5f2ea, #f5f2ea 4px, #fbfaf6 4px, #fbfaf6 8px);
   color: var(--fa-muted);
 }
+
+/* Many funds: numbered columns, smaller cells, so the matrix stays readable. */
+.fa-matrix--compact .fa-matrix__grid { --fa-matrix-col: 34px; --fa-matrix-label: 170px; font-size: 10px; }
+.fa-matrix--compact .fa-matrix__col { justify-content: flex-end; font-weight: 700; }
+.fa-matrix--compact .fa-matrix__row { line-height: 1.2; }
+.fa-matrix--compact .fa-matrix__row b { margin-right: auto; padding-right: 6px; color: var(--fa-muted); font-weight: 700; }
+.fa-matrix--compact .fa-matrix__cell, .fa-matrix--compact .fa-matrix__self { height: 30px; font-size: 10px; }
 
 .fa-matrix__legend { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 10px; color: var(--color-gray); }
 .fa-matrix__legend i { width: 120px; height: 5px; border-radius: 3px; background: linear-gradient(90deg, #f6eedc, #c29035, #7c5a1c); }
@@ -618,6 +647,30 @@ td.fa-table__fund em {
 
 @media (max-width: 900px) {
   .fa-overlap { grid-template-columns: 1fr; }
+  .fa-summary__stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .fa-summary__stats > div + div { border-left: 0; }
+  .fa-summary__stats > div:not(:nth-child(3n + 1)) { border-left: 1px solid var(--fa-border); }
+  .fa-summary__stats > div:nth-child(n + 4) { border-top: 1px solid var(--fa-border); }
+  .fa-matrix--compact .fa-matrix__grid { --fa-matrix-label: 130px; }
+}
+
+/* Phones: each table row becomes a small labelled card, so nothing scrolls sideways. */
+@media (max-width: 600px) {
+  .fa-summary { padding: 14px 16px; }
+  .fa-summary__stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fa-summary__stats > div:not(:nth-child(3n + 1)) { border-left: 0; }
+  .fa-summary__stats > div:nth-child(n + 4) { border-top: 0; }
+  .fa-summary__stats > div:nth-child(even) { border-left: 1px solid var(--fa-border); }
+  .fa-summary__stats > div:nth-child(n + 3) { border-top: 1px solid var(--fa-border); }
+  .fa-summary__stats > div:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .fa-summary__stats dd { font-size: 16px; }
+  .fa-summary details > table, .fa-summary__group { margin: 8px 10px 10px; }
+  .fa-summary details > table { width: calc(100% - 20px); }
+  .fa-summary__table thead { display: none; }
+  .fa-summary__table tr { display: block; padding: 6px 0; border-top: 1px solid var(--fa-border); }
+  .fa-summary__table td { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; padding: 2px 0; border: 0; }
+  .fa-summary__table td::before { content: attr(data-label); font-size: 10px; font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; color: var(--fa-muted); }
+  .fa-matrix--compact .fa-matrix__grid { --fa-matrix-label: 110px; --fa-matrix-col: 32px; }
 }
 
 @media (max-width: 760px) {
@@ -655,3 +708,9 @@ td.fa-table__fund em {
    pair details below; columns may narrow so that many funds still fit the page. */
 .fa-export .fa-overlap { grid-template-columns: minmax(0, 1fr); }
 .fa-export .fa-matrix__grid { --fa-matrix-col: 48px; min-width: 0; }
+/* Many funds: the columns share the page width (36 funds is about 22px each), so no column is cut off. */
+.fa-export .fa-matrix--compact .fa-matrix__grid { --fa-matrix-col: 0px; --fa-matrix-label: 150px; gap: 1px; font-size: 8px; }
+.fa-export .fa-matrix--compact .fa-matrix__cell,
+.fa-export .fa-matrix--compact .fa-matrix__self { height: 24px; border-width: 1px; border-radius: 2px; font-size: 8px; }
+.fa-export .fa-matrix--compact .fa-matrix__cell--active { border-color: transparent; }
+.fa-export .fa-summary__table td { padding: 4px 8px; }

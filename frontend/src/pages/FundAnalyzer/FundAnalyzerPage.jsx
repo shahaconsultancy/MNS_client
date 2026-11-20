@@ -151,8 +151,8 @@ export default function FundAnalyzerPage() {
       await new Promise((resolve) => requestAnimationFrame(resolve)); // let the copy lay out
       const stamp = new Date().toISOString().slice(0, 10);
       await savePageAsPdf(exportRef.current, `Fund Analyzer Report - ${stamp}.pdf`, {
-        hide: ['form.fa-notice', '.fa-fund__foot button', '.fa-detail__more', '.fa-notice__more'],
-        unclip: ['.fa-notice__body', '.fa-table-wrap', '.fa-matrix__scroll', '.fa-pair__list', '.fa-fund__holdings--all'],
+        hide: ['form.fa-notice', '.fa-fund__foot button', '.fa-detail__more'],
+        unclip: ['.fa-table-wrap', '.fa-matrix__scroll', '.fa-pair__list', '.fa-fund__holdings--all'],
         keepTogether: ['.fa-card', '.fa-stats', '.fa-notice', '.fa-fund', '.fa-detail', '.fa__empty'],
         footer: (page, pages) => `Fund Analyzer Report  |  ${stamp}  |  Page ${page} of ${pages}`,
       });
